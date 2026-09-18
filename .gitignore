@@ -4,3 +4,4 @@ bin/
 tmp/
 *.log
 .idea/
+project-dump.txt
