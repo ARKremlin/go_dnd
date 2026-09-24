@@ -11,10 +11,11 @@ import (
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 )
 
+//go:embed sql/*.sql
 var FS embed.FS
 
 func Run(dsn string) error {
-	src, err := iofs.New(FS, ".")
+	src, err := iofs.New(FS, "sql")
 	if err != nil {
 		return fmt.Errorf("migrations: source: %w", err)
 	}
