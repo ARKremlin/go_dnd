@@ -49,17 +49,20 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tok, err := h.auth.LoginDM(r.Context(), req.Username, req.Password)
+	u, err := h.auth.RegisterDM(r.Context(), req.Username, req.Password)
 	if err != nil {
 		switch {
-		case errors.Is(err, usecase.ErrInvalidCredentials):
-			respondError(w, http.StatusUnauthorized, "invalid credentiails")
+		case errors.Is(err, usecase.ErrInvalidInput):
+			respondError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, usecase.ErrUsernameTaken):
+			respondError(w, http.StatusBadRequest, err.Error())
+
 		default:
 			respondError(w, http.StatusInternalServerError, "internal server error")
 		}
 		return
 	}
-	respondJSON(w, http.StatusOK, loginResponse{Token: tok})
+	respondJSON(w, http.StatusCreated, toUserResponse(u))
 }
 
 func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
@@ -73,7 +76,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, usecase.ErrInvalidCredentials):
-			respondError(w, http.StatusUnauthorized, "invalid credentiails")
+			respondError(w, http.StatusUnauthorized, "invalid credentials")
 		default:
 			respondError(w, http.StatusInternalServerError, "internal server error")
 		}
