@@ -1,0 +1,105 @@
+package handler
+
+import (
+	"encoding/json"
+	"errors"
+	"net/http"
+
+	"github.com/ARKremlin/go_dnd/internal/domain"
+	"github.com/ARKremlin/go_dnd/internal/usecase"
+)
+
+type AuthHandler struct {
+	auth *usecase.AuthUseCase
+}
+
+func NewAuthHandler(auth *usecase.AuthUseCase) *AuthHandler {
+	return &AuthHandler{auth: auth}
+}
+
+type registerRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type loginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type loginResponse struct {
+	Token string `json:"token"`
+}
+
+type userResponse struct {
+	ID         string `json:"id"`
+	Username   string `json:"username"`
+	Role       string `json:"role"`
+	Created_at string `json:"created_at"`
+}
+
+type errorResponse struct {
+	Error string `json:"error"`
+}
+
+func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
+	var req registerRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+
+	tok, err := h.auth.LoginDM(r.Context(), req.Username, req.Password)
+	if err != nil {
+		switch {
+		case errors.Is(err, usecase.ErrInvalidCredentials):
+			respondError(w, http.StatusUnauthorized, "invalid credentiails")
+		default:
+			respondError(w, http.StatusInternalServerError, "internal server error")
+		}
+		return
+	}
+	respondJSON(w, http.StatusOK, loginResponse{Token: tok})
+}
+
+func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
+	var req loginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+
+	tok, err := h.auth.LoginDM(r.Context(), req.Username, req.Password)
+	if err != nil {
+		switch {
+		case errors.Is(err, usecase.ErrInvalidCredentials):
+			respondError(w, http.StatusUnauthorized, "invalid credentiails")
+		default:
+			respondError(w, http.StatusInternalServerError, "internal server error")
+		}
+		return
+	}
+	respondJSON(w, http.StatusOK, loginResponse{Token: tok})
+}
+
+func toUserResponse(u *domain.User) userResponse {
+	resp := userResponse{
+		ID:   u.ID.String(),
+		Role: string(u.Role),
+	}
+	if u.Username != nil {
+		resp.Username = *u.Username
+	}
+	resp.Created_at = u.CreatedAt.UTC().Format("2006-01-02T15:04:05Z")
+	return resp
+}
+
+func respondJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func respondError(w http.ResponseWriter, status int, msg string) {
+	respondJSON(w, status, errorResponse{Error: msg})
+}
