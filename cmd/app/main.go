@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ARKremlin/go_dnd/internal/config"
+	"github.com/ARKremlin/go_dnd/internal/migrations"
 	"github.com/ARKremlin/go_dnd/internal/pkg/logger"
 	"github.com/ARKremlin/go_dnd/internal/repository/postgres"
 	"github.com/ARKremlin/go_dnd/internal/transport/rest"
@@ -28,13 +29,19 @@ func main() {
 	slog.SetDefault(lgr)
 	lgr.Info("config loaded", "port", cfg.App.Port, "log_level", cfg.App.Loglevel)
 
+	if err := migrations.Run(cfg.DB.DSN()); err != nil {
+		lgr.Error("migrations failed", "err", err)
+		os.Exit(1)
+	}
+	lgr.Info("migrations applied")
+
 	ctx, stop := signal.NotifyContext(
 		context.Background(), os.Interrupt)
 	defer stop()
 
 	pool, err := postgres.NewPool(ctx, cfg.DB.DSN(), postgres.DefaultPoolConfig())
 	if err != nil {
-		lgr.Error("pool init:", "err", err)
+		lgr.Error("pool initlgr.Info(\"server stooped\")", "err", err)
 		os.Exit(1)
 	}
 	defer pool.Close()
@@ -71,5 +78,5 @@ func main() {
 		lgr.Error("server shutdown:", "err", err)
 	}
 
-	lgr.Info("server stooped")
+	lgr.Info("server stopped")
 }
