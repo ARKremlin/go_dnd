@@ -63,8 +63,8 @@ func main() {
 
 	go func() {
 		lgr.Info("starting server", "addr", srv.Addr)
-		if err := srv.ListenAndServe(); err != nil && errors.Is(err, http.ErrServerClosed) {
-			lgr.Error("server shutdown:", "err", err)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			lgr.Error("server error", "err", err)
 		}
 	}()
 
