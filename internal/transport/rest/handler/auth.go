@@ -32,10 +32,10 @@ type loginResponse struct {
 }
 
 type userResponse struct {
-	ID         string `json:"id"`
-	Username   string `json:"username"`
-	Role       string `json:"role"`
-	Created_at string `json:"created_at"`
+	ID        string `json:"id"`
+	Username  string `json:"username"`
+	Role      string `json:"role"`
+	CreatedAt string `json:"created_at"`
 }
 
 type errorResponse struct {
@@ -93,7 +93,7 @@ func toUserResponse(u *domain.User) userResponse {
 	if u.Username != nil {
 		resp.Username = *u.Username
 	}
-	resp.Created_at = u.CreatedAt.UTC().Format("2006-01-02T15:04:05Z")
+	resp.CreatedAt = u.CreatedAt.UTC().Format("2006-01-02T15:04:05Z")
 	return resp
 }
 
