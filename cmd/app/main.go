@@ -12,8 +12,10 @@ import (
 
 	"github.com/ARKremlin/go_dnd/internal/config"
 	"github.com/ARKremlin/go_dnd/internal/pkg/logger"
-	"github.com/ARKremlin/go_dnd/internal/transport/rest/middleware"
-	"github.com/go-chi/chi/v5"
+	"github.com/ARKremlin/go_dnd/internal/repository/postgres"
+	"github.com/ARKremlin/go_dnd/internal/transport/rest"
+	"github.com/ARKremlin/go_dnd/internal/transport/rest/handler"
+	"github.com/ARKremlin/go_dnd/internal/usecase"
 )
 
 func main() {
@@ -26,89 +28,48 @@ func main() {
 	slog.SetDefault(lgr)
 	lgr.Info("config loaded", "port", cfg.App.Port, "log_level", cfg.App.Loglevel)
 
-	//// SMOKE
-	//
-	//ctx := context.Background()
-	//pool, err := postgres.NewPool(ctx, cfg.DB.DSN(), postgres.DefaultPoolConfig())
-	//if err != nil {
-	//	lgr.Error("pool init:", err)
-	//	os.Exit(1)
-	//}
-	//defer pool.Close()
-	//
-	//repo := postgres.NewUserRepo(pool)
-	//
-	//uname := "dm_" + uuid.New().String()[:8]
-	//pwdHash, err := hasher.HashPassword("secret")
-	//
-	//if err != nil {
-	//	lgr.Error("hashing password:", err)
-	//	os.Exit(1)
-	//}
-	//u := domain.User{
-	//	Username:     &uname,
-	//	PasswordHash: &pwdHash,
-	//	Role:         domain.RoleDM,
-	//}
-	//if err := repo.Create(ctx, &u); err != nil {
-	//	lgr.Error("create user:", err)
-	//	os.Exit(1)
-	//}
-	//lgr.Info("created", "id", u.ID, "username", *u.Username, "created_at", u.CreatedAt)
-	//
-	//got, err := repo.GetByUsername(ctx, uname)
-	//if err != nil {
-	//	lgr.Error("get user by username:", err)
-	//	os.Exit(1)
-	//}
-	//if got.ID != u.ID {
-	//	lgr.Error("id mismatch", "got", got.ID, "created", u.ID)
-	//	os.Exit(1)
-	//}
-	//lgr.Info("found", "id", got.ID, "role", got.Role)
-	//dup := &domain.User{
-	//	Username:     &uname,
-	//	PasswordHash: &pwdHash,
-	//	Role:         domain.RoleDM,
-	//}
-	//err = repo.Create(ctx, dup)
-	//if !errors.Is(err, domain.ErrUserAlreadyExists) {
-	//	lgr.Error("expected ErrUserAlreadyExists", "got", err)
-	//	os.Exit(1)
-	//}
-	//lgr.Info("duplicate rejected as expected")
-	//// end of SMOKE
-
-	r := chi.NewRouter()
-	r.Use(middleware.RequestID)
-	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
-	srv := &http.Server{
-		Addr:              ":" + cfg.App.Port,
-		Handler:           r,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
 	ctx, stop := signal.NotifyContext(
 		context.Background(), os.Interrupt)
 	defer stop()
+
+	pool, err := postgres.NewPool(ctx, cfg.DB.DSN(), postgres.DefaultPoolConfig())
+	if err != nil {
+		lgr.Error("pool init:", "err", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	userRepo := postgres.NewUserRepo(pool)
+	authUC := usecase.NewAuthUseCase(userRepo, []byte(cfg.JWT.Secret), cfg.JWT.TTL)
+	authHandler := handler.NewAuthHandler(authUC)
+
+	router := rest.NewRouter(rest.RouterDeps{
+		AuthHandler: authHandler,
+		JWTSecret:   []byte(cfg.JWT.Secret),
+	})
+
+	srv := &http.Server{
+		Addr:              ":" + cfg.App.Port,
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
 	go func() {
-		lgr.Info("http server started", "addr", srv.Addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			lgr.Error("http server error", "err", err)
+		lgr.Info("starting server", "addr", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && errors.Is(err, http.ErrServerClosed) {
+			lgr.Error("server shutdown:", "err", err)
 		}
 	}()
-	<-ctx.Done()
-	lgr.Info("shutdown signal received")
 
-	shutdownCtx, cancel := context.WithTimeout(
-		context.Background(), 10*time.Second)
+	<-ctx.Done()
+	lgr.Info("shutting down server", "addr", srv.Addr)
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		lgr.Error("http server shutdown error", "err", err)
+		lgr.Error("server shutdown:", "err", err)
 	}
 
-	lgr.Info("http server stopped")
+	lgr.Info("server stooped")
 }
