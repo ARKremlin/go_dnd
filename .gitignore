@@ -5,3 +5,4 @@ tmp/
 *.log
 .idea/
 project-dump.txt
+backup.sql
