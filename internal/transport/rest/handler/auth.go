@@ -55,7 +55,7 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, usecase.ErrInvalidInput):
 			respondError(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, usecase.ErrUsernameTaken):
-			respondError(w, http.StatusBadRequest, err.Error())
+			respondError(w, http.StatusConflict, err.Error())
 
 		default:
 			respondError(w, http.StatusInternalServerError, "internal server error")
