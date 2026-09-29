@@ -6,6 +6,7 @@ import (
 	"github.com/ARKremlin/go_dnd/internal/transport/rest/handler"
 	"github.com/ARKremlin/go_dnd/internal/transport/rest/middleware"
 	"github.com/go-chi/chi/v5"
+	chimw "github.com/go-chi/chi/v5/middleware"
 )
 
 type RouterDeps struct {
@@ -17,6 +18,8 @@ func NewRouter(deps RouterDeps) http.Handler {
 	r := chi.NewRouter()
 
 	r.Use(middleware.RequestID)
+	r.Use(middleware.AccessLog)
+	r.Use(chimw.Recoverer)
 
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
