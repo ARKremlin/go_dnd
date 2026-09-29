@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/ARKremlin/go_dnd/internal/config"
@@ -36,12 +37,12 @@ func main() {
 	lgr.Info("migrations applied")
 
 	ctx, stop := signal.NotifyContext(
-		context.Background(), os.Interrupt)
+		context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	pool, err := postgres.NewPool(ctx, cfg.DB.DSN(), postgres.DefaultPoolConfig())
 	if err != nil {
-		lgr.Error("pool initlgr.Info(\"server stooped\")", "err", err)
+		lgr.Error("pool init", "err", err)
 		os.Exit(1)
 	}
 	defer pool.Close()
