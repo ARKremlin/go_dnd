@@ -21,18 +21,23 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		slog.Error("fatal", "err", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	cfg, err := config.Load()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "config load:", err)
-		os.Exit(1)
+		return fmt.Errorf("load config: %w", err)
 	}
 	lgr := logger.New(cfg.App.Loglevel)
 	slog.SetDefault(lgr)
 	lgr.Info("config loaded", "port", cfg.App.Port, "log_level", cfg.App.Loglevel)
 
 	if err := migrations.Run(cfg.DB.DSN()); err != nil {
-		lgr.Error("migrations failed", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("run migrations: %w", err)
 	}
 	lgr.Info("migrations applied")
 
@@ -42,8 +47,7 @@ func main() {
 
 	pool, err := postgres.NewPool(ctx, cfg.DB.DSN(), postgres.DefaultPoolConfig())
 	if err != nil {
-		lgr.Error("pool init", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("pool init: %w", err)
 	}
 	defer pool.Close()
 
@@ -56,7 +60,7 @@ func main() {
 		JWTSecret:   []byte(cfg.JWT.Secret),
 	})
 
-	srv := &http.Server{
+	srv := http.Server{
 		Addr:              ":" + cfg.App.Port,
 		Handler:           router,
 		ReadHeaderTimeout: 10 * time.Second,
@@ -76,8 +80,9 @@ func main() {
 	defer cancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		lgr.Error("server shutdown:", "err", err)
+		return fmt.Errorf("shutdown server: %w", err)
 	}
 
-	lgr.Info("server stopped")
+	lgr.Info("shutdown complete")
+	return nil
 }
