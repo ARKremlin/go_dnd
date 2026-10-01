@@ -8,6 +8,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
+
 	"github.com/ARKremlin/go_dnd/internal/pkg/token"
 
 	"github.com/ARKremlin/go_dnd/internal/domain"
@@ -90,6 +92,14 @@ func (uc *AuthUseCase) LoginDM(ctx context.Context, username, password string) (
 		return "", fmt.Errorf("failed to generate token: %w", err)
 	}
 	return tok, nil
+}
+
+func (uc *AuthUseCase) GetMe(ctx context.Context, userID uuid.UUID) (*domain.User, error) {
+	u, err := uc.users.GetByID(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user by ID: %w", err)
+	}
+	return u, nil
 }
 
 func validateUsername(s string) error {

@@ -7,6 +7,7 @@ import (
 
 	"github.com/ARKremlin/go_dnd/internal/domain"
 	"github.com/ARKremlin/go_dnd/internal/pkg/logger"
+	"github.com/ARKremlin/go_dnd/internal/transport/rest/middleware"
 	"github.com/ARKremlin/go_dnd/internal/usecase"
 )
 
@@ -83,6 +84,26 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respondJSON(w, http.StatusOK, loginResponse{Token: tok})
+}
+
+func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.UserIDFromContext(r.Context())
+	if !ok {
+		respondError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	u, err := h.auth.GetMe(r.Context(), userID)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrUserNotFound):
+			respondError(w, http.StatusUnauthorized, "unauthorized")
+		default:
+			respondInternalError(w, r, err)
+		}
+		return
+	}
+	respondJSON(w, http.StatusOK, toUserResponse(u))
 }
 
 func toUserResponse(u *domain.User) userResponse {

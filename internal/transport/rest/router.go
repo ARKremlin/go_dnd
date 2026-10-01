@@ -34,21 +34,8 @@ func NewRouter(deps RouterDeps) http.Handler {
 
 		r.Group(func(r chi.Router) {
 			r.Use(middleware.Auth(deps.JWTSecret))
-			r.Get("/me", meHandler)
+			r.Get("/me", deps.AuthHandler.Me)
 		})
 	})
 	return r
-}
-
-func meHandler(w http.ResponseWriter, r *http.Request) {
-	userID, ok := middleware.UserIDFromContext(r.Context())
-	if !ok {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-	role, _ := middleware.RoleFromContext(r.Context())
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"user_id":"` + userID.String() + `","role":"` + role + `"}`))
 }
