@@ -9,10 +9,15 @@ import (
 )
 
 type Config struct {
-	App   App
-	DB    DB
-	Redis Redis
-	JWT   JWT
+	App      App
+	DB       DB
+	Redis    Redis
+	JWT      JWT
+	Telegram Telegram
+}
+
+type Telegram struct {
+	BotToken string `env:"TELEGRAM_BOT_TOKEN" env-required:"true"`
 }
 
 type App struct {
