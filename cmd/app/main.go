@@ -82,15 +82,22 @@ func run() error {
 		tgBot.Start(ctx)
 	}()
 
+	serverErr := make(chan error, 1)
 	go func() {
 		lgr.Info("starting server", "addr", srv.Addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			lgr.Error("server error", "err", err)
+			serverErr <- err
 		}
 	}()
 
-	<-ctx.Done()
-	lgr.Info("shutting down server", "addr", srv.Addr)
+	var runErr error
+	select {
+	case <-ctx.Done():
+		lgr.Info("shutting down server", "addr", srv.Addr)
+	case err := <-serverErr:
+		runErr = fmt.Errorf("http server: %w", err)
+		stop()
+	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -99,8 +106,11 @@ func run() error {
 
 	wg.Wait()
 
+	if runErr != nil {
+		return runErr
+	}
 	if shutdownErr != nil {
-		return fmt.Errorf("server shutdown: %w", shutdownErr)
+		return runErr
 	}
 
 	lgr.Info("shutdown complete")
