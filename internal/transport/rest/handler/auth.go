@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/ARKremlin/go_dnd/internal/domain"
+	"github.com/ARKremlin/go_dnd/internal/pkg/logger"
 	"github.com/ARKremlin/go_dnd/internal/usecase"
 )
 
@@ -56,9 +57,8 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 			respondError(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, usecase.ErrUsernameTaken):
 			respondError(w, http.StatusConflict, err.Error())
-
 		default:
-			respondError(w, http.StatusInternalServerError, "internal server error")
+			respondInternalError(w, r, err)
 		}
 		return
 	}
@@ -78,7 +78,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, usecase.ErrInvalidCredentials):
 			respondError(w, http.StatusUnauthorized, "invalid credentials")
 		default:
-			respondError(w, http.StatusInternalServerError, "internal server error")
+			respondInternalError(w, r, err)
 		}
 		return
 	}
@@ -105,4 +105,13 @@ func respondJSON(w http.ResponseWriter, status int, v any) {
 
 func respondError(w http.ResponseWriter, status int, msg string) {
 	respondJSON(w, status, errorResponse{Error: msg})
+}
+
+func respondInternalError(w http.ResponseWriter, r *http.Request, err error) {
+	logger.FromContext(r.Context()).Error("internal error",
+		"err", err,
+		"method", r.Method,
+		"path", r.URL.Path,
+	)
+	respondError(w, http.StatusInternalServerError, "internal server error")
 }
