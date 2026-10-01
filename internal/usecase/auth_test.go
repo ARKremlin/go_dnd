@@ -15,7 +15,7 @@ type mockUserRepo struct {
 	getByID func(ctx context.Context, id uuid.UUID) (*domain.User, error)
 }
 
-func (m mockUserRepo) GetByID(ctx context.Context, id uuid.UUID) (*domain.User, error) {
+func (m *mockUserRepo) GetByID(ctx context.Context, id uuid.UUID) (*domain.User, error) {
 	return m.getByID(ctx, id)
 }
 
