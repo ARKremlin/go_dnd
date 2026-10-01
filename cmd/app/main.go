@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/ARKremlin/go_dnd/internal/repository/postgres"
 	"github.com/ARKremlin/go_dnd/internal/transport/rest"
 	"github.com/ARKremlin/go_dnd/internal/transport/rest/handler"
+	"github.com/ARKremlin/go_dnd/internal/transport/telegram"
 	"github.com/ARKremlin/go_dnd/internal/usecase"
 )
 
@@ -60,11 +62,25 @@ func run() error {
 		JWTSecret:   []byte(cfg.JWT.Secret),
 	})
 
+	tgBot, err := telegram.New(cfg.Telegram.BotToken, lgr)
+	if err != nil {
+		return fmt.Errorf("telegram init: %w", err)
+	}
+
 	srv := http.Server{
 		Addr:              ":" + cfg.App.Port,
 		Handler:           router,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+		tgBot.Start(ctx)
+	}()
 
 	go func() {
 		lgr.Info("starting server", "addr", srv.Addr)
@@ -79,8 +95,12 @@ func run() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("shutdown server: %w", err)
+	shutdownErr := srv.Shutdown(shutdownCtx)
+
+	wg.Wait()
+
+	if shutdownErr != nil {
+		return fmt.Errorf("server shutdown: %w", shutdownErr)
 	}
 
 	lgr.Info("shutdown complete")
