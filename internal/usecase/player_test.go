@@ -3,6 +3,7 @@ package usecase
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"testing"
 
 	"github.com/ARKremlin/go_dnd/internal/domain"
@@ -11,26 +12,36 @@ import (
 
 type mockPlayerRepo struct {
 	domain.UserRepository
-	existing  *domain.User
-	getErr    error
-	createErr error
-	updateErr error
-	creates   int
-	updates   int
+	existing      *domain.User
+	afterConflict *domain.User
+	getErr        error
+	createErrs    []error
+	updateErr     error
+	gets          int
+	creates       int
+	updates       int
 }
 
 func (m *mockPlayerRepo) GetByTelegramID(ctx context.Context, telegramID int64) (*domain.User, error) {
+	m.gets++
 	if m.getErr != nil {
 		return nil, m.getErr
+	}
+	if m.gets > 1 && m.afterConflict != nil {
+		return m.afterConflict, nil
 	}
 	if m.existing == nil {
 		return nil, domain.ErrUserNotFound
 	}
 	return m.existing, nil
 }
+
 func (m *mockPlayerRepo) Create(ctx context.Context, u *domain.User) error {
 	m.creates++
-	return m.createErr
+	if m.creates <= len(m.createErrs) {
+		return m.createErrs[m.creates-1]
+	}
+	return nil
 }
 
 func (m *mockPlayerRepo) Update(ctx context.Context, u *domain.User) error {
@@ -58,15 +69,17 @@ func TestPlayerUsecase_GetOrCreatePlayer(t *testing.T) {
 	dbErr := errors.New("connection refused")
 
 	test := []struct {
-		name         string
-		inUsername   string
-		existing     *domain.User
-		getErr       error
-		createErr    error
-		wantErr      error
-		wantUsername string
-		wantCreates  int
-		wantUpdates  int
+		name          string
+		inUsername    string
+		existing      *domain.User
+		getErr        error
+		createErrs    []error
+		updateErr     error
+		afterConflict *domain.User
+		wantErr       error
+		wantUsername  string
+		wantCreates   int
+		wantUpdates   int
 	}{
 		{
 			name:         "new player with username",
@@ -112,15 +125,60 @@ func TestPlayerUsecase_GetOrCreatePlayer(t *testing.T) {
 		},
 		{
 			name:        "create failure",
-			createErr:   dbErr,
+			createErrs:  []error{dbErr},
 			wantErr:     dbErr,
+			wantCreates: 1,
+		},
+		{
+			name:         "username taken on update keeps old one",
+			inUsername:   "taken",
+			existing:     playerWithUsername("old_petr"),
+			updateErr:    domain.ErrUserAlreadyExists,
+			wantUsername: "old_petr",
+			wantUpdates:  1,
+		},
+		{
+			name:        "update failure",
+			inUsername:  "new_petr",
+			existing:    playerWithUsername("old_petr"),
+			updateErr:   dbErr,
+			wantErr:     dbErr,
+			wantUpdates: 1,
+		},
+		{
+			name:          "parallel start already created the player",
+			inUsername:    "petr",
+			createErrs:    []error{domain.ErrUserAlreadyExists},
+			afterConflict: playerWithUsername("petr"),
+			wantUsername:  "petr",
+			wantCreates:   1,
+		},
+		{
+			name:         "username taken on create makes player without it",
+			inUsername:   "taken",
+			createErrs:   []error{domain.ErrUserAlreadyExists, nil},
+			wantUsername: "",
+			wantCreates:  2,
+		},
+		{
+			name:        "conflict without username is an error",
+			inUsername:  "",
+			createErrs:  []error{domain.ErrUserAlreadyExists},
+			wantErr:     domain.ErrUserAlreadyExists,
 			wantCreates: 1,
 		},
 	}
 	for _, tt := range test {
 		t.Run(tt.name, func(t *testing.T) {
-			repo := &mockPlayerRepo{existing: tt.existing, getErr: tt.getErr, createErr: tt.createErr}
-			uc := NewPlayerUseCase(repo)
+			repo := &mockPlayerRepo{
+				existing:      tt.existing,
+				afterConflict: tt.afterConflict,
+				getErr:        tt.getErr,
+				createErrs:    tt.createErrs,
+				updateErr:     tt.updateErr,
+			}
+			
+			uc := NewPlayerUseCase(repo, slog.New(slog.DiscardHandler))
 
 			got, err := uc.GetOrCreatePlayer(context.Background(), 42, tt.inUsername)
 			if !errors.Is(err, tt.wantErr) {
