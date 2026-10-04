@@ -56,13 +56,14 @@ func run() error {
 	userRepo := postgres.NewUserRepo(pool)
 	authUC := usecase.NewAuthUseCase(userRepo, []byte(cfg.JWT.Secret), cfg.JWT.TTL)
 	authHandler := handler.NewAuthHandler(authUC)
+	playerUC := usecase.NewPlayerUseCase(userRepo, lgr)
 
 	router := rest.NewRouter(rest.RouterDeps{
 		AuthHandler: authHandler,
 		JWTSecret:   []byte(cfg.JWT.Secret),
 	})
 
-	tgBot, err := telegram.New(cfg.Telegram.BotToken, lgr)
+	tgBot, err := telegram.New(cfg.Telegram.BotToken, lgr, playerUC)
 	if err != nil {
 		return fmt.Errorf("telegram init: %w", err)
 	}
@@ -110,7 +111,7 @@ func run() error {
 		return runErr
 	}
 	if shutdownErr != nil {
-		return runErr
+		return shutdownErr
 	}
 
 	lgr.Info("shutdown complete")

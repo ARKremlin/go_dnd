@@ -10,15 +10,17 @@ import (
 )
 
 type Bot struct {
-	api *bot.Bot
-	log *slog.Logger
+	api     *bot.Bot
+	log     *slog.Logger
+	players PlayerService
 }
 
-func New(token string, log *slog.Logger) (*Bot, error) {
-	tb := &Bot{log: log.With("component", "telegram")}
+func New(token string, log *slog.Logger, players PlayerService) (*Bot, error) {
+	tb := &Bot{log: log.With("component", "telegram"), players: players}
 
 	api, err := bot.New(token,
 		bot.WithDefaultHandler(tb.handleDefault),
+		bot.WithMessageTextHandler("/start", bot.MatchTypeExact, tb.handleStart),
 		bot.WithErrorsHandler(tb.handleError),
 	)
 	if err != nil {

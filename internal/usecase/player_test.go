@@ -177,7 +177,7 @@ func TestPlayerUsecase_GetOrCreatePlayer(t *testing.T) {
 				createErrs:    tt.createErrs,
 				updateErr:     tt.updateErr,
 			}
-			
+
 			uc := NewPlayerUseCase(repo, slog.New(slog.DiscardHandler))
 
 			got, err := uc.GetOrCreatePlayer(context.Background(), 42, tt.inUsername)

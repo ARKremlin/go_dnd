@@ -9,22 +9,22 @@ import (
 )
 
 type PoolConfig struct {
-	MaxConns         int32
-	MinConns         int32
-	MaxConnLifetime  time.Duration
-	MaxConnIdleTime  time.Duration
-	HealthChekPeriod time.Duration
-	ConnectTimeout   time.Duration
+	MaxConns          int32
+	MinConns          int32
+	MaxConnLifetime   time.Duration
+	MaxConnIdleTime   time.Duration
+	HealthCheckPeriod time.Duration
+	ConnectTimeout    time.Duration
 }
 
 func DefaultPoolConfig() PoolConfig {
 	return PoolConfig{
-		MaxConns:         10,
-		MinConns:         1,
-		MaxConnLifetime:  time.Hour,
-		MaxConnIdleTime:  30 * time.Minute,
-		HealthChekPeriod: time.Minute,
-		ConnectTimeout:   5 * time.Second,
+		MaxConns:          10,
+		MinConns:          1,
+		MaxConnLifetime:   time.Hour,
+		MaxConnIdleTime:   30 * time.Minute,
+		HealthCheckPeriod: time.Minute,
+		ConnectTimeout:    5 * time.Second,
 	}
 }
 
@@ -38,7 +38,7 @@ func NewPool(ctx context.Context, dsn string, cfg PoolConfig) (*pgxpool.Pool, er
 	poolCfg.MinConns = cfg.MinConns
 	poolCfg.MaxConnLifetime = cfg.MaxConnLifetime
 	poolCfg.MaxConnIdleTime = cfg.MaxConnIdleTime
-	poolCfg.HealthCheckPeriod = cfg.HealthChekPeriod
+	poolCfg.HealthCheckPeriod = cfg.HealthCheckPeriod
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
