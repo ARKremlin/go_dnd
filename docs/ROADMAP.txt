@@ -1,0 +1,1428 @@
+ТЗ — go_dnd (D&D 5e)
+
+1. Общие сведения и архитектура системы
+Проект представляет собой бэкенд-сервис для проведения пошаговых боёв по правилам D&D 5e без графического интерфейса (Headless VTT).
+
+Технологический стек:
+- Основной язык: Go (Clean Architecture, REST API, slog, internal Event Bus на каналах chan Event).
+- PostgreSQL: единственный источник истины (Single Source of Truth, SSOT) для всех персистентных данных, включая текущее состояние боя.
+- Redis: буфер событий боя для polling. Кэш очереди инициативы и текущего раунда отложен (TD-24).
+- Хранилище медиа: MinIO / S3 (аватарки персонажей и токены монстров). Адаптер — internal/pkg/storage. В БД хранятся только URL.
+- Клиентские интерфейсы:
+  - Мастер (DM): Swagger UI (интерактивная документация REST API) и Postman-коллекция в репозитории. События боя получает через polling (периодический GET с указанием последнего полученного события).
+  - Игроки (Players): Telegram Bot API (библиотека github.com/go-telegram/bot, управление через инлайн-кнопки).
+
+Слои зависят только внутрь:
+
+transport (REST, Telegram)  ->  usecase  ->  domain  <-  repository (PostgreSQL)
+
+domain: сущности, доменные ошибки, интерфейсы репозиториев.
+usecase: бизнес-логика, знает только интерфейсы.
+repository/postgres: реализация интерфейсов на pgx.
+transport/rest, transport/telegram: входящие запросы, преобразование ошибок в ответы.
+
+2. Аутентификация, роли и схема данных
+
+2.1. Модель пользователей
+Единая таблица users с гибкой структурой полей в зависимости от роли (role: player | dm):
+- Игрок (Player): заполняются telegram_id (BIGINT, unique) и telegram_username (TEXT, unique, nullable). Поле password_hash — NULL. Поле username — NULL.
+- Мастер (DM): заполняются username и password_hash. Поля telegram_id и telegram_username — NULL. Авторизация через REST API (/login) с выдачей JWT-токена.
+
+2.2. Схема базы данных (PostgreSQL)
+
+users:
+- id UUID, PK, DEFAULT uuid_generate_v4()
+- telegram_id BIGINT, UNIQUE (частичный), NULLABLE
+- telegram_username TEXT, UNIQUE (частичный), NULLABLE
+- username TEXT, UNIQUE (частичный), NULLABLE
+- password_hash TEXT, NULLABLE
+- role TEXT, NOT NULL, CHECK IN ('player', 'dm')
+- created_at TIMESTAMPTZ, NOT NULL, DEFAULT NOW()
+
+CHECK-констрейнт users_role_consistency:
+- role = 'player' → telegram_id IS NOT NULL AND password_hash IS NULL AND username IS NULL
+- role = 'dm' → telegram_id IS NULL AND telegram_username IS NULL AND username IS NOT NULL AND password_hash IS NOT NULL
+
+Частичные индексы: по telegram_id, telegram_username, username (там, где значение не NULL).
+
+tables:
+- id UUID, PK
+- dm_id UUID, FK → users.id ON DELETE CASCADE
+- name VARCHAR(128), NOT NULL
+- created_at TIMESTAMPTZ, NOT NULL
+Индекс idx_tables_dm_id.
+
+table_members:
+- id UUID, PK
+- table_id UUID, FK → tables.id ON DELETE CASCADE
+- player_id UUID, FK → users.id ON DELETE CASCADE
+- status VARCHAR(16), NOT NULL, DEFAULT 'pending', CHECK IN ('pending', 'accepted', 'declined')
+- created_at TIMESTAMPTZ, NOT NULL
+UNIQUE (table_id, player_id). Индексы по table_id и player_id.
+
+characters:
+- id UUID, PK
+- player_id UUID, FK → users.id ON DELETE CASCADE, UNIQUE
+- name VARCHAR(64)
+- race, class — идентификаторы из JSON-правил
+- level INT, DEFAULT 1, CHECK (level >= 1)
+- xp INT, DEFAULT 0, CHECK (xp >= 0)
+- max_hp INT, CHECK (max_hp > 0)
+- current_hp INT, CHECK (current_hp >= 0 AND current_hp <= max_hp)
+- ac INT
+- stats_json JSONB, NOT NULL
+- actions_json JSONB, NOT NULL, DEFAULT '[]'
+- bonus_actions_json JSONB, NOT NULL, DEFAULT '[]'
+- avatar_url VARCHAR(512), NULLABLE
+- created_at TIMESTAMPTZ, NOT NULL
+
+bestiary_templates:
+- id UUID, PK
+- dm_id UUID, FK → users.id ON DELETE CASCADE
+- name VARCHAR(128)
+- ac INT
+- max_hp INT, CHECK (max_hp > 0)
+- xp_reward INT, NOT NULL, DEFAULT 0, CHECK (xp_reward >= 0)
+- stats_json, actions_json, bonus_actions_json JSONB
+- avatar_url VARCHAR(512), NULLABLE
+- created_at TIMESTAMPTZ, NOT NULL
+Индекс idx_bestiary_dm_id.
+
+encounters:
+- id UUID, PK
+- table_id UUID, FK → tables.id ON DELETE CASCADE
+- status VARCHAR(16), NOT NULL, DEFAULT 'preparing', CHECK IN ('preparing', 'active', 'finished')
+- round INT, NOT NULL, DEFAULT 0
+- current_turn INT, NOT NULL, DEFAULT 0
+- created_at TIMESTAMPTZ, NOT NULL
+- finished_at TIMESTAMPTZ, NULLABLE
+Индекс по table_id. Частичный уникальный индекс ON encounters(table_id) WHERE status IN ('preparing', 'active') — не больше одного незавершённого боя на стол.
+
+encounter_entities:
+- id UUID, PK
+- encounter_id UUID, FK → encounters.id ON DELETE CASCADE
+- entity_type CHECK IN ('player', 'monster')
+- source_id UUID (characters.id для игрока, bestiary_templates.id для монстра)
+- display_name VARCHAR(128)
+- current_hp, max_hp, ac INT
+- stats_json, actions_json, bonus_actions_json JSONB, NOT NULL
+- xp_reward INT, NOT NULL, DEFAULT 0
+- status VARCHAR(16), NOT NULL, DEFAULT 'active', CHECK IN ('active', 'unconscious', 'dead')
+- initiative_score INT, NULLABLE
+- turn_position INT, NULLABLE
+- action_used BOOL, NOT NULL, DEFAULT FALSE
+- bonus_action_used BOOL, NOT NULL, DEFAULT FALSE
+UNIQUE (encounter_id, turn_position). Индекс по encounter_id.
+
+dice_rolls_log:
+- id UUID, PK
+- encounter_id UUID, FK → encounters.id ON DELETE CASCADE
+- actor_name, action_name, roll_type CHECK IN ('initiative', 'attack', 'damage'), dice_formula
+- result_detail JSONB
+- created_at TIMESTAMPTZ, NOT NULL
+Индекс (encounter_id, created_at).
+
+2.3. Файловое хранилище (MinIO / S3)
+- Валидация: строгий фильтр расширений .png, .jpg, .jpeg и типа по содержимому (http.DetectContentType).
+- Ограничение: максимальный размер файла — 5 МБ.
+- Хранение: файлы — в MinIO. В БД — только avatar_url.
+
+3. Движок правил и игровой процесс
+
+3.1. Конфигурация правил (JSON Rules Engine)
+Все игровые константы вынесены в JSON-файлы в configs/rules/:
+- races.json: Человек, Эльф, Дварф + stat_modifiers.
+- classes.json: Воин, Жрец, Волшебник + base_stats, starting_hp, hit_die, actions, bonus_actions.
+- leveling.json: пороги XP для автоматического повышения уровня.
+Путь к правилам задаётся через RULES_DIR (в Docker — /configs/rules).
+
+Схема действия (в actions_json и bonus_actions_json):
+{name, attack_bonus, damage_formula}
+Пока поддерживаются только атакующие действия.
+
+3.2. Кубики и модификатор характеристики
+- Формат формул: XdY, XdY+Z, XdY-Z, dY. Ограничения: 1 ≤ X ≤ 100, 2 ≤ Y ≤ 1000, |Z| ≤ 1000.
+- Modifier(score) = (score - 10) >> 1 (арифметический сдвиг, округление вниз — как в правилах D&D).
+- Критическое попадание удваивает количество кубиков урона (бонус не меняется).
+
+3.3. Сценарий боя (Combat Flow)
+1. Формирование боя: Мастер через REST API выбирает монстров из бестиария (с автогенерацией копий: «Гоблин #1», «Гоблин #2») и отмечает присутствующих игроков.
+2. Бросок инициативы:
+   - Последовательный расчёт 1d20 + Modifier(DEX) для каждой сущности.
+   - Разрешение ничьих: больший Modifier(DEX) выше. При полном равенстве — игрок ходит раньше монстра.
+   - Финальный детерминирующий ключ — display_name.
+3. Ход участника:
+   - 1 основное действие + 1 бонусное действие.
+   - Атака: 1d20 + attack_bonus vs AC. Натуральная 1 — промах, натуральная 20 — попадание и крит (кубики урона ×2).
+   - Формула урона — из actions_json атакующего.
+   - Переход хода — по явной команде.
+4. Условия падения (HP = 0):
+   - Монстр получает статус dead и пропускается.
+   - Персонаж игрока получает статус unconscious, пропускает ходы до конца боя.
+   - После боя HP всех игроков восстанавливается до максимума.
+5. Финал боя и XP:
+   - Мастер вызывает POST /finish.
+   - Суммарный XP всех убитых монстров начисляется полностью каждому игроку (решение отличается от официальных правил D&D — см. раздел 6).
+   - Проверка порога из leveling.json → автоматическое повышение уровня.
+   - Рост HP на уровне: max(1, hit_die/2 + 1 + Modifier(CON)).
+
+4. Архитектура событий (Event Bus и polling)
+Event Bus — ядро real-time. SSE не используется; вместо него Redis event buffer и polling со стороны клиента.
+
+[ Игрок (TG) / Мастер (REST/Swagger) ]
+         |
+         v
+[ REST / TG Controller ]
+         |
+         v
+[ Combat Engine Logic ] --(запись)--> [ PostgreSQL (SSOT) ]
+         |
+         v
+[ Event Bus (chan Event) ]
+         |---> [ DB Log Subscriber ]         -> dice_rolls_log
+         |---> [ Redis Event Buffer ]        -> encounter:<id>:events (list, TTL 24h)
+         |---> [ TG Notification Publisher ] -> чаты игроков
+
+Правила:
+- События публикуются только после успешного commit транзакции.
+- Подписчики регистрируются один раз при старте и сами фильтруют по encounter_id.
+- Буфер канала подписчика — 256; при переполнении пишется предупреждение в лог (остаток проблемы — TD-23).
+- Close() закрывает каналы подписчиков; run() дожидается их завершения через sync.WaitGroup.
+
+Как работает polling:
+1. Каждое игровое действие → Event → Event Bus.
+2. Redis Event Buffer Subscriber выполняет RPUSH encounter:<id>:events <json> и EXPIRE ... 86400 в одном pipeline.
+3. Мастер периодически (раз в 1–2 секунды) вызывает:
+   GET /api/v1/encounters/:id/events?after=<index>
+4. Сервер выполняет LRANGE encounter:<id>:events <index> -1, возвращает массив новых событий и next_index.
+5. Если клиент пришёл с after больше текущей длины списка (истёк TTL), возвращается next_index = LLEN без ошибки.
+6. Клиент (Swagger UI, Postman, скрипт) обновляет локальный индекс и повторяет запрос.
+TTL списка — 24 часа от последнего события.
+
+Преимущества перед SSE:
+- Проще в отладке (curl возвращает результат, а не висит).
+- Не требует http.Flusher и долгоживущих соединений.
+- Работает через любой прокси.
+- Задержка 1–2 секунды не критична для пошагового боя.
+
+5. Дорожная карта
+Детальный план спринтов — в отдельном документе «Дорожная карта разработки (Sprint Roadmap)». Краткая сводка:
+- Спринт 1: инфраструктура и авторизация Мастера.
+- Спринт 2: игровые столы, инвайты, каркас Telegram-бота.
+- Спринт 3: кубики, Rules Engine, персонажи, бестиарий, S3.
+- Спринт 4: боевой движок, Event Bus, polling, XP.
+- Спринт 5: Swagger UI, контейнеризация, CI, документация.
+
+6. Решения, отличающиеся от официальных правил D&D 5e
+Зафиксированы осознанно:
+- XP: суммарный XP убитых монстров начисляется полностью каждому игроку. По официальным правилам XP делится между участниками.
+- Стартовые HP: берутся из classes.json без учёта расового бонуса к CON (упрощение).
+- AC: 10 + Modifier(DEX) (без брони и щитов).
+Всё остальное (попадание ≥ AC, натуральные 1 и 20, крит удваивает кубики урона, рост HP на уровне, пороги XP) — официальные правила.
+
+
+Дорожная карта разработки (Sprint Roadmap)
+Версия 2.3. Основание: редакция v2.2 с правками по итогам Спринтов 2–5 и TECH_DEBT.
+
+Общие соглашения, действующие во всех спринтах.
+- Команды выполняются из корня проекта в PowerShell 7. Алиас для Compose:
+
+  function dc { docker compose -f deploy/docker-compose.yml --env-file .env @args }
+
+- SQL: dc exec postgres psql -U go_dnd_user -d go_dnd -c "...".
+- HTTP: curl.exe (не curl); JSON — снаружи одинарные кавычки, внутри двойные.
+- Миграции лежат в internal/migrations/sql/. Нумерация:
+  000001 — users;
+  000002 — уникальные частичные индексы;
+  000003 — tables, table_members;
+  000004 — characters, bestiary_templates;
+  000005 — encounters, encounter_entities, dice_rolls_log.
+- Слои: usecase знает только интерфейсы (репозитории, нотификатор). Интерфейс объявляется там, где используется. transport маппит доменные ошибки в HTTP-коды. Ответы с кодом ≥ 500 логируются с request_id.
+- Пустые списки в JSON отдаём как [], а не null (make([]T, 0)).
+- Каждая задача — отдельный коммит. В конце спринта go vet ./... && go test ./... зелёные.
+
+Спринт 1. Инфраструктура, БД (SSOT), логирование, аутентификация DM
+Длительность: 2 недели.
+Фокус: фундамент приложения, окружение, схема БД, REST API аутентификации Мастера.
+
+Task 1.1. Каркас Go-проекта и Clean Architecture
+Что делаем: инициализируем Go-модуль и раскладываем архитектуру по слоям.
+Пошаговый план:
+1. go mod init <module-path> в корне проекта.
+2. Структура каталогов:
+   cmd/app/ — точка входа
+   internal/domain/ — сущности и интерфейсы репозиториев
+   internal/usecase/ — бизнес-логика
+   internal/repository/postgres/ — реализации репозиториев
+   internal/transport/rest/ — HTTP-хэндлеры
+   internal/transport/rest/middleware/ — middleware
+   internal/transport/telegram/ — Telegram-бот
+   internal/config/ — конфигурация
+   internal/pkg/logger/, internal/pkg/token/, internal/pkg/hasher/
+   internal/pkg/storage/, internal/pkg/rules/, internal/pkg/dice/
+   internal/eventbus/ — шина событий
+   internal/migrations/ — SQL-миграции и загрузчик
+   configs/rules/ — JSON-правила
+   deploy/ — docker-compose и Dockerfile
+   docs/ — Postman-коллекция, TECH_DEBT
+3. Базовые зависимости: pgx/v5, chi/v5, golang-jwt/v5, cleanenv, golang-migrate, google/uuid, bcrypt.
+Как проверить: минимальный cmd/app/main.go с fmt.Println("Server initialized"). go run ./cmd/app — без ошибок.
+
+Task 1.2. PostgreSQL 16 и Redis 7 в Docker Compose
+Что делаем: готовим локальные базы данных.
+Пошаговый план:
+1. .env.example: POSTGRES_*, REDIS_*, JWT_SECRET, JWT_TTL, APP_PORT, LOG_LEVEL.
+2. deploy/docker-compose.yml с сервисами postgres:16-alpine и redis:7-alpine.
+3. Пробросить порты, настроить healthcheck, объявить volumes.
+4. .gitignore — исключить .env, bin/, tmp/.
+Как проверить: cp .env.example .env, затем cd deploy && docker compose up -d. docker compose ps — оба healthy.
+
+Task 1.3. Конфигурация, slog, graceful shutdown
+Что делаем: чтение .env, JSON-логи, безопасная остановка.
+Пошаговый план:
+1. Установить cleanenv и godotenv.
+2. internal/config/config.go — структура Config с секциями App, DB, Redis, JWT, Telegram. Теги env-required:"true". Метод DSN().
+3. internal/pkg/logger/logger.go — slog JSON, функции WithRequestID, RequestIDFromContext, FromContext.
+4. cmd/app/main.go — вынести всю логику в func run() error. main только вызывает run() и при ошибке пишет её в лог и делает os.Exit(1).
+5. signal.NotifyContext, HTTP-сервер в горутине, srv.Shutdown с таймаутом 10 секунд. При падении сервера — stop() и graceful shutdown.
+6. Middleware RequestID: генерирует UUID, кладёт в контекст, добавляет в заголовок ответа X-Request-ID.
+Как проверить: go run ./cmd/app — JSON-логи. curl localhost:8080/healthz → ok. Ctrl+C → shutdown signal received → http server stopped.
+
+Task 1.4. Миграция 000001 — users
+Что делаем: схема users для игроков и мастеров.
+Пошаговый план:
+1. internal/migrations/sql/000001_create_users_table.up.sql и .down.sql.
+2. В up.sql: CREATE EXTENSION IF NOT EXISTS "uuid-ossp"; таблица users (id, telegram_id, telegram_username, username, password_hash, role, created_at) с типами по разделу 2.2 ТЗ; CHECK users_role_check: role IN ('player','dm'); CHECK users_role_consistency (см. ТЗ); частичные индексы по telegram_id, telegram_username, username.
+3. В down.sql: DROP TABLE IF EXISTS users CASCADE.
+Как проверить: применить вручную через psql. \d users. Тестовые вставки: корректные игрок и мастер — успех; игрок без telegram_id — ошибка; мастер без password_hash — ошибка.
+
+Task 1.5. Утилиты Hasher и Token
+Что делаем: пакеты для безопасности.
+Пошаговый план:
+1. Установить golang.org/x/crypto/bcrypt и golang-jwt/jwt/v5.
+2. internal/pkg/hasher/hasher.go: HashPassword, CheckPassword.
+3. internal/pkg/token/token.go: Claims (UserID, Role, RegisteredClaims), GenerateToken, ValidateToken (HS256).
+4. Unit-тесты для обоих пакетов.
+Как проверить: go test ./internal/pkg/... — зелёные.
+
+Task 1.6. PostgreSQL-репозиторий пользователей
+Что делаем: DAL на pgx/v5.
+Пошаговый план:
+1. Установить pgx/v5 и pgxpool.
+2. internal/repository/postgres/db.go — NewPool с параметрами пула, Ping с таймаутом.
+3. internal/domain/user.go: User с полями ID, TelegramID *int64, TelegramUsername *string, Username *string, PasswordHash *string, Role, CreatedAt; Role с константами; ошибки ErrUserNotFound, ErrUserAlreadyExists; интерфейс UserRepository: Create, GetByID, GetByUsername, GetByTelegramID, GetByTelegramUsername, Update.
+4. internal/repository/postgres/user.go — реализация. Маппинг: pgx.ErrNoRows → ErrUserNotFound; код 23505 → ErrUserAlreadyExists.
+Как проверить: временный вызов из main.go: создать мастера, найти по username, попробовать дубликат — ErrUserAlreadyExists.
+
+Task 1.7. Usecase, REST-хэндлеры, Auth Middleware
+Что делаем: auth-логика и роутинг.
+Пошаговый план:
+1. internal/usecase/auth.go: RegisterDM, LoginDM, GetMe.
+2. internal/transport/rest/handler/auth.go: POST /api/v1/auth/register, POST /api/v1/auth/login (возвращает { "token": "..." }), GET /api/v1/me.
+3. internal/transport/rest/middleware/auth.go: Auth(secret) — читает Authorization: Bearer, валидирует, кладёт user_id и role в контекст.
+4. internal/transport/rest/middleware/context.go: WithUserID, UserIDFromContext, WithRole, RoleFromContext.
+5. internal/transport/rest/middleware/access_log.go: логирование запросов с request_id.
+6. internal/transport/rest/router.go: chi-роутер, RequestID, AccessLog, chimw.Recoverer. Публичные /api/v1/auth/*, защищённая группа с GET /api/v1/me.
+Как проверить: через curl.exe: register → 201; login → JWT; /me с токеном → данные; без токена → 401. Для несуществующего пользователя GET /me → 401.
+
+Task 1.8. Auto-migrate через embed.FS
+Что делаем: миграции внутри бинарника.
+Пошаговый план:
+1. Установить golang-migrate/v4 с драйверами postgres и iofs.
+2. internal/migrations/migrations.go: //go:embed sql/*.sql, var FS embed.FS.
+3. Run(dsn string) error — открывает iofs, m.Up(), игнорирует ErrNoChange.
+4. Вызвать в main.go до инициализации пула.
+Как проверить: docker compose down -v && up -d. go run ./cmd/app. Логи: «migrations applied». \dt — таблица есть. Повторный запуск — без ошибок.
+
+DoD Спринта 1.
+- Postgres + Redis поднимаются.
+- Миграции применяются автоматически.
+- Мастер регистрируется, логинится, получает JWT.
+- JSON-логи с x-request-id.
+- Graceful shutdown работает.
+
+Спринт 2. Столы, инвайты, Telegram-каркас
+Длительность: 2 недели.
+Фокус: связать REST Мастера с Telegram-ботом: стол → инвайт по @username → игрок принимает или отклоняет.
+
+Что изменилось относительно v2.2:
+- Новая 2.1 — хвосты Спринта 1: run() error, лог 500, настоящий /me.
+- telegram_username нормализуется (lowercase, без @).
+- Инвайт: описаны 404, 409 и 502; при сбое Telegram запись откатывается.
+- Callback: атомарный UPDATE ... WHERE status='pending', обработка устаревших кнопок (TD-19).
+- Graceful shutdown бота (TD-13). GetOrCreatePlayer не затирает username пустым значением (TD-14).
+- Миграция теперь 000003.
+- Новая 2.9 — подготовка репозитория к публикации.
+
+Task 2.1. Хвосты Спринта 1
+Что делаем: закрываем три пункта техдолга, пока код небольшой.
+Пошаговый план:
+1. cmd/app/main.go: вынести всю логику в func run() error. main вызывает run() и при ошибке пишет её в лог и делает os.Exit(1). Причина: os.Exit не выполняет defer, поэтому defer pool.Close() внутри main не сработает.
+2. respondError (или аналог в хендлерах): для статуса ≥ 500 логировать исходную ошибку через логгер из контекста (logger.FromContext(ctx).Error(...)), клиенту отдавать общий текст без деталей.
+3. GET /api/v1/me: AuthUseCase.GetMe(ctx, userID) → UserRepository.GetByID → userResponse. Если пользователя нет — 401.
+4. Тесты: для GetMe написать table-driven тест с mock-репозиторием.
+Как проверить:
+- /me с токеном возвращает данные из БД.
+- dc stop postgres и запрос → клиент получает 500 без деталей, в логе есть строка error с request_id. Потом dc start postgres.
+- go test ./... зелёный.
+
+Task 2.2. Подключение Telegram-бота
+Что делаем: long-polling через github.com/go-telegram/bot с корректной остановкой.
+Пошаговый план:
+1. Создать бота у @BotFather, токен положить в .env как TELEGRAM_BOT_TOKEN; в .env.example — заглушка.
+2. go get github.com/go-telegram/bot.
+3. internal/config: Telegram{BotToken string} с env:"TELEGRAM_BOT_TOKEN" env-required:"true". Токен никогда не пишем в логи.
+4. internal/transport/telegram/bot.go: New(token string, log *slog.Logger, players PlayerService) (*Bot, error) и Start(ctx context.Context). Start блокируется до ctx.Done(). PlayerService описывается здесь же; его реализация появится в Task 2.3.
+5. В run(): запустить Start в горутине под общим ctx, добавить sync.WaitGroup. Перед выходом из run() дождаться остановки бота (wg.Wait()).
+6. Пока зарегистрировать только default-хендлер, который логирует входящее сообщение.
+Как проверить: написать боту, в логе появится запись. Ctrl+C: сначала «telegram bot stopped», потом «server stopped», процесс завершается сам без зависших горутин.
+
+Task 2.3. /start и telegram_username
+Что делаем: регистрация игрока при первом /start.
+Пошаговый план:
+1. NormalizeTelegramUsername(s string) string: убрать ведущий @, strings.ToLower, strings.TrimSpace. Положить в internal/domain.
+2. internal/usecase/player.go: GetOrCreatePlayer(ctx, telegramID int64, username string): GetByTelegramID нашёл игрока — если username != "" и он отличается от сохранённого, вызвать Update; если пришёл пустой username, ничего не менять (не затирать NULL-ом существующее значение). Не нашёл — создать с ролью player. ErrUserAlreadyExists при записи username (ник занят другим пользователем): залогировать warn, попытаться сохранить игрока без username.
+3. internal/transport/telegram/handlers.go: handleStart (приветствие + подсказка «Мастер пригласит вас за стол по @username»). Регистрация хендлеров — через bot.WithMessageTextHandler в telegram.New (Task 2.2).
+4. Table-driven тесты usecase с mock-репозиторием: новый игрок, смена ника, пустой ник, конфликт ника.
+Как проверить: /start → запись с telegram_id, telegram_username в нижнем регистре, role=player, password_hash=NULL. Сменить ник и снова /start → username в БД обновился. Убрать ник у аккаунта, снова /start → в БД остался прежний.
+
+Task 2.4. Миграция 000003 — tables и table_members
+Что делаем: DDL для столов и участников.
+Пошаговый план:
+1. Файлы internal/migrations/sql/000003_create_tables_and_members.up.sql и .down.sql.
+2. tables: id (UUID PK, генерация как в 000001), dm_id (FK → users.id ON DELETE CASCADE), name VARCHAR(128) NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(). Индекс idx_tables_dm_id.
+3. table_members: id, table_id (FK → tables.id CASCADE), player_id (FK → users.id CASCADE), status VARCHAR(16) NOT NULL DEFAULT 'pending' с CHECK IN ('pending','accepted','declined'), created_at. UNIQUE (table_id, player_id). Индексы по table_id и player_id.
+4. Имя tables в PostgreSQL допустимо без кавычек.
+5. dm_id не гарантируется FK: это проверяет usecase (Task 2.5).
+6. down.sql: в обратном порядке (table_members, затем tables).
+Как проверить: go run ./cmd/app → в логе «migrations applied». dc exec postgres psql -U go_dnd_user -d go_dnd -c "\d table_members". Невалидный статус и дубликат пары (table_id, player_id) дают ошибки.
+
+Task 2.5. REST создания стола + RequireRole
+Что делаем: POST /api/v1/tables под JWT Мастера.
+Пошаговый план:
+1. internal/domain/table.go: Table, TableMember, тип MemberStatus с константами, ошибки ErrTableNotFound, ErrMemberExists. Интерфейс TableRepository: Create, GetByID, ListByDM.
+2. internal/repository/postgres/table.go: реализация, ошибки через mapPgError.
+3. middleware.RequireRole(role domain.Role): читает роль из контекста (её кладёт Auth), при несовпадении отвечает 403. Навесить на группу /api/v1/tables.
+4. internal/usecase/table.go: CreateTable(ctx, dmID, name). Имя: strings.TrimSpace, длина 1–128 рун (utf8.RuneCountInString), иначе ErrInvalidInput.
+5. handler/table.go: CreateTable принимает {"name": "..."}, dm_id берёт из контекста, отвечает 201 и {id, name, created_at}.
+6. Тесты: usecase (валидация имени) и RequireRole (через httptest).
+Как проверить:
+curl.exe -i -X POST http://localhost:8080/api/v1/tables `
+  -H "Authorization: Bearer $token" `
+  -H "Content-Type: application/json" `
+  -d '{"name":"Подземелье Дракона"}'
+Ожидается 201. Без токена — 401. В БД запись с правильным dm_id.
+
+Task 2.6. REST инвайта
+Что делаем: POST /api/v1/tables/{id}/invites.
+Пошаговый план:
+1. В usecase объявить интерфейс InviteNotifier { SendInvite(ctx, telegramID int64, tableName string, tableID uuid.UUID) error }. Реализация живёт в transport/telegram/notifier.go. Так usecase не зависит от Telegram.
+2. TableMemberRepository: Create, Delete(ctx, tableID, playerID), GetByTableAndPlayer, UpdateStatus (Task 2.7), ListMembers (Task 2.8).
+3. usecase/invite.go: InvitePlayer(ctx, dmID, tableID, telegramUsername): NormalizeTelegramUsername, проверка ^[a-z0-9_]{5,32}$, иначе ErrInvalidInput (400); стол существует и принадлежит dmID, иначе ErrTableNotFound (404; для чужого стола тоже 404, чтобы не раскрывать существование); GetByTelegramUsername. Не найден → ErrPlayerNotFound (404) с текстом «Игрок не найден. Попросите его написать боту /start»; TableMemberRepository.Create со статусом pending. Дубликат → ErrMemberExists (409, для любого существующего статуса); notifier.SendInvite. Если Telegram вернул ошибку, удалить созданную запись (Delete) и вернуть ErrNotifyFailed (502). Если и Delete не удался, залогировать.
+4. notifier.go: сообщение «Мастер приглашает вас за стол «<name>»» и две inline-кнопки. callback_data: invite:accept:<table_id> и invite:decline:<table_id> (длина 50 байт, лимит Telegram 64).
+5. Тесты usecase с mock-репозиториями и mock-нотификатором: успех, стол не найден, игрок не найден, дубликат, сбой Telegram (запись удалена).
+Как проверить: POST с {"telegram_username":"@your_nick"} → игроку приходит сообщение с двумя кнопками, в БД pending. Повторный POST → 409. Несуществующий ник → 404.
+
+Task 2.7. Callback-хэндлеры Telegram
+Что делаем: обработка нажатий кнопок инвайта.
+Пошаговый план:
+1. Зарегистрировать хэндлер callback-запросов с префиксом invite:. Проверить по документации версии библиотеки из go.mod, какой именно тип и режим совпадения (prefix) она предлагает.
+2. Парсить callback_data строго: ровно 3 части через :, действие ∈ {accept, decline}, table_id — валидный UUID. Всё остальное игнорировать с логом.
+3. Игрок находится по telegram_id (GetByTelegramID).
+4. TableMemberRepository.UpdateStatus(ctx, tableID, playerID, newStatus) выполняет UPDATE ... SET status=3WHEREtable_i d=1 AND player_id=$2 AND status='pending' и проверяет число затронутых строк. 0 строк → ErrInviteNotActual. Так двойной клик безопасен.
+5. Всегда вызывать AnswerCallbackQuery, иначе у пользователя крутится «часики». На ErrInviteNotActual — ответ с show_alert «Приглашение уже неактуально».
+6. При успехе — EditMessageText: «Вы приняли/отклонили приглашение за стол «...»», без кнопок.
+7. Тест UpdateStatus с mock и (по желанию) parse-функции callback_data.
+Как проверить: «Принять» → сообщение меняется, status='accepted'. Новый инвайт и «Отклонить» → declined. Нажать кнопку на уже обработанном сообщении → alert, БД не меняется.
+
+Task 2.8. REST просмотра столов и участников
+Что делаем: GET /api/v1/tables и GET /api/v1/tables/{id}/members.
+Пошаговый план:
+1. TableRepository.ListByDM, TableMemberRepository.ListMembers (JOIN на users за telegram_username).
+2. Usecase проверяет владение столом: чужой или несуществующий → 404.
+3. Хендлеры: список столов [{id, name, created_at}]; участники [{player_id, telegram_username, status}]. Пустые списки → [].
+4. Пагинацию пока не делаем (TD-17).
+Как проверить: GET /api/v1/tables → массив. GET /api/v1/tables/<id>/members → участники со статусами. Чужой стол → 404.
+
+Task 2.9. Подготовка репозитория к публикации
+Что делаем: делаем репозиторий публичным без утечки секретов. Выполнить до начала откликов на вакансии.
+Пошаговый план:
+1. Проверить, что .env никогда не попадал в историю:
+   git log --all --oneline -- .env
+   git log --all -p | Select-String -Pattern "TELEGRAM_BOT_TOKEN=\S+|JWT_SECRET=\S+|POSTGRES_PASSWORD=\S+"
+   Первая команда должна быть пустой. Во второй смотреть только на заглушки из .env.example. Если найден реальный токен бота, отозвать его в @BotFather (/revoke), а не переписывать историю.
+2. .env.example содержит все переменные, только с заглушками. .gitignore исключает .env.
+3. Минимальный README.md: что это за проект, стек, как запустить (dc up -d, go run ./cmd/app), статус спринтов, ссылка на docs/.
+4. Положить файлы docs/sprint-*.md и docs/TECH_DEBT.md в репозиторий.
+5. Сделать репозиторий публичным (GitHub → Settings → Danger Zone → Change visibility), добавить описание и topics (go, dnd, telegram-bot, postgresql).
+Как проверить: открыть репозиторий в режиме инкогнито: код виден, .env нет, README читается.
+
+DoD Спринта 2.
+- Мастер создаёт стол.
+- Инвайт по @username приходит игроку.
+- Кнопки меняют статус в БД.
+
+Спринт 3. Кубики, Rules Engine, персонажи, бестиарий, S3
+Длительность: 2 недели.
+Фокус: правила, файловое хранилище, FSM-конструктор, CRUD бестиария.
+
+Что изменилось относительно v2.2:
+- Кубики и модификатор вынесены в отдельную Task 3.3 (нужны и правилам, и бестиарию, и бою).
+- Формула модификатора (score-10)>>1 вместо /2.
+- Формат actions_json определён явно.
+- AC персонажа: 10 + Modifier(DEX).
+- Проверка картинок: расширение + реальное содержимое файла.
+- Путь к правилам через RULES_DIR (TD-08).
+- Бакет создаёт само приложение.
+- Миграция теперь 000004.
+- Новая 3.8: Мастер видит персонажей стола.
+
+Task 3.1. MinIO в docker-compose
+Что делаем: S3-хранилище локально.
+Пошаговый план:
+1. В deploy/docker-compose.yml сервис minio (образ minio/minio, команда server /data --console-address ":9001"), порты 9000 и 9001, volume, переменные MINIO_ROOT_USER и MINIO_ROOT_PASSWORD из .env.
+2. Healthcheck. В современных образах MinIO есть mc ready local; проверить в документации образа своей версии. Запасной вариант: curl -f http://localhost:9000/minio/health/live, если в образе есть curl.
+3. .env.example: MINIO_ROOT_USER, MINIO_ROOT_PASSWORD, MINIO_ENDPOINT (localhost:9000 для запуска на хосте), MINIO_BUCKET, MINIO_USE_SSL=false, MINIO_PUBLIC_URL (http://localhost:9000).
+4. Бакет автоматически создаёт приложение (Task 3.2).
+Как проверить: dc up -d, dc ps — minio healthy. Консоль на http://localhost:9001, логин из .env.
+
+Task 3.2. S3-адаптер internal/pkg/storage
+Что делаем: клиент MinIO с безопасной валидацией.
+Пошаговый план:
+1. go get github.com/minio/minio-go/v7. StorageConfig в internal/config.
+2. storage.New(cfg, log): создаёт клиента, проверяет бакет (BucketExists), при отсутствии создаёт (MakeBucket) и ставит политику анонимного чтения (GetObject).
+3. ValidateImage(filename string, size int64, head []byte) error: расширение (без учёта регистра) ∈ {.png, .jpg, .jpeg}; size ≤ 5 МБ (5 << 20); тип по содержимому: http.DetectContentType(head) (первые 512 байт) ∈ {image/png, image/jpeg}. Заголовку Content-Type из запроса не доверяем.
+4. Upload(ctx, r io.Reader, size int64, prefix, ext string) (objectName, url string, err error). Имя объекта: <prefix>/<uuid>.<ext>, где prefix — avatars или tokens. Имя файла от пользователя в объект не попадает.
+5. Delete(ctx, objectName). PublicURL(objectName) строит URL из MINIO_PUBLIC_URL.
+6. Интерфейс ImageStorage (Upload, Delete) объявить там, где он используется (FSM, бестиарий), чтобы подменять mock-реализацией в тестах.
+7. Чтение файла: первые 512 байт нужны для проверки, поэтому читать их в буфер, затем склеивать io.MultiReader(bytes.NewReader(head), rest).
+Как проверить: unit-тесты ValidateImage: настоящие сигнатуры PNG (\x89PNG\r\n\x1a\n) и JPEG (\xff\xd8\xff) проходят; %PDF отклонён; .gif отклонён; 6 МБ отклонён; .png с содержимым PDF отклонён. Ручная проверка: Upload небольшого PNG, URL открывается в браузере.
+
+Task 3.3. Кубики и модификатор характеристики
+Что делаем: пакет internal/pkg/dice и функция Modifier. Используются в правилах, бестиарии, инициативе и бою.
+Пошаговый план:
+1. dice.Parse(formula string) (Formula, error): формат XdY, XdY+Z, XdY-Z, dY (X по умолчанию 1). Пробелы вокруг игнорируются. Ограничения: 1 ≤ X ≤ 100, 2 ≤ Y ≤ 1000, |Z| ≤ 1000. Разбор через regexp.
+2. Formula{Count, Sides, Bonus int} с методом Crit() Formula (удваивает Count, Bonus не меняется).
+3. Источник случайности через интерфейс Source { IntN(n int) int }. Продакшн-реализация — на math/rand/v2 (rand.IntN), в тестах — фиксированная.
+4. Roller.Roll(f Formula) Result{Rolls []int, Bonus, Total int}. Список выпавших значений нужен для result_detail.
+5. internal/domain/abilities.go: func Modifier(score int) int { return (score - 10) >> 1 }. Сдвиг знакового числа в Go арифметический, то есть округляет вниз, как требуют правила.
+6. Константы ключей характеристик: STR, DEX, CON, INT, WIS, CHA.
+Как проверить: table-driven тесты. Parse: "1d20", "2d6+3", "d8", "1d20-1" — ок; "abc", "0d6", "1d0", "101d6", "2d6+" — ошибка. Roll с фиксированным источником: детерминированный результат. Modifier: 7→-2, 8→-1, 9→-1, 10→0, 11→0, 12→1, 20→5.
+
+Task 3.4. Загрузчик правил
+Что делаем: JSON-правила и пакет internal/pkg/rules.
+Формат файлов (configs/rules/; идентификаторы — латиница, name — отображаемое имя).
+races.json:
+{"races": [
+  {"id": "human", "name": "Человек", "stat_modifiers": {"STR": 1, "DEX": 1, "CON": 1, "INT": 1, "WIS": 1, "CHA": 1}},
+  {"id": "elf",   "name": "Эльф",    "stat_modifiers": {"DEX": 2}},
+  {"id": "dwarf", "name": "Дварф",   "stat_modifiers": {"CON": 2}}
+]}
+classes.json (остальные классы — по образцу):
+{"classes": [
+  {"id": "fighter", "name": "Воин",
+   "base_stats": {"STR": 15, "DEX": 12, "CON": 14, "INT": 10, "WIS": 10, "CHA": 8},
+   "starting_hp": 12, "hit_die": 10,
+   "actions": [{"name": "Удар мечом", "attack_bonus": 4, "damage_formula": "1d8+2"}],
+   "bonus_actions": [{"name": "Удар щитом", "attack_bonus": 4, "damage_formula": "1d4+2"}]}
+]}
+Схема действия (actions_json и bonus_actions_json в БД — массив таких объектов): {name, attack_bonus, damage_formula}.
+leveling.json (официальные пороги XP):
+{"levels": [
+  {"level": 1, "xp_threshold": 0},     {"level": 2, "xp_threshold": 300},
+  {"level": 3, "xp_threshold": 900},   {"level": 4, "xp_threshold": 2700},
+  {"level": 5, "xp_threshold": 6500},  {"level": 6, "xp_threshold": 14000},
+  {"level": 7, "xp_threshold": 23000}, {"level": 8, "xp_threshold": 34000},
+  {"level": 9, "xp_threshold": 48000}, {"level": 10, "xp_threshold": 64000}
+]}
+Пошаговый план:
+1. RULES_DIR в конфиге (env-default:"configs/rules"); в Docker — /configs/rules (Task 5.3).
+2. rules.Load(dir) (*Rules, error): читает три файла, валидирует: уникальные id; у класса заданы все 6 характеристик; hit_die ∈ {6, 8, 10, 12}; damage_formula проходит dice.Parse; уровни идут подряд с 1, XP строго возрастает, у уровня 1 порог 0.
+3. Геттеры Race(id) (Race, bool), Class(id) (Class, bool), LevelForXP(xp int) int (максимальный уровень, порог которого ≤ xp; выше последнего — последний), а также списки для кнопок в Telegram в стабильном порядке.
+4. Геттеры возвращают копии (в структурах есть map и слайсы).
+5. В run(): ошибка загрузки правил — фатальная.
+Как проверить: unit-тесты на фикстурах в testdata/: корректные файлы; отсутствующий файл; битый JSON; неверная формула; LevelForXP(0)=1, (299)=1, (300)=2, (999999)=10. Убрать файл → приложение не стартует с понятной ошибкой.
+
+Task 3.5. Миграция 000004 — characters и bestiary_templates
+Что делаем: DDL для персонажей и монстров.
+Пошаговый план:
+1. internal/migrations/sql/000004_create_characters_and_bestiary.up.sql и .down.sql.
+2. characters: см. раздел 2.2 ТЗ.
+3. bestiary_templates: см. раздел 2.2 ТЗ. Индекс idx_bestiary_dm_id.
+4. down.sql — в обратном порядке.
+Как проверить: \d characters, \d bestiary_templates. Второй персонаж у того же player_id → ошибка UNIQUE. current_hp > max_hp → ошибка CHECK.
+
+Task 3.6. Telegram-конструктор персонажа (FSM)
+Что делаем: пошаговый диалог /create_character.
+Пошаговый план:
+1. internal/transport/telegram/fsm.go: состояния Idle, ChoosingRace, ChoosingClass, EnteringName, UploadingAvatar. Хранилище map[int64]*session под sync.Mutex. В session — состояние, черновик (raceID, classID, name) и время последнего действия; сессия старше 30 минут считается протухшей. /cancel сбрасывает диалог. Состояние хранится в памяти; после перезапуска диалог начинается заново.
+2. /create_character: если у игрока уже есть персонаж (GetByPlayerID) — отказ.
+3. Раса: inline-кнопки из rules (callback_data: race:<id>). Класс: class:<id>. Проверять, что состояние сессии соответствует нажатой кнопке.
+4. Имя: текст, 1–64 рун (utf8.RuneCountInString), после TrimSpace.
+5. Фото (обязательно по ТЗ): взять самый большой размер из Photo, получить ссылку на файл через методы библиотеки (GetFile и генерация ссылки на скачивание — сверить с документацией версии из go.mod), проверить file_size до скачивания, скачать, ValidateImage, Upload с префиксом avatars. Документы и прочие типы сообщений на этом шаге отклонять с подсказкой. Ошибка загрузки → сообщение игроку, состояние остаётся прежним.
+6. Расчёт: stats[k] = class.base_stats[k] + race.stat_modifiers[k]; ac = 10 + domain.Modifier(stats["DEX"]); max_hp = current_hp = class.starting_hp; level=1, xp=0; actions_json и bonus_actions_json копируются из класса.
+7. Сохранение; ErrCharacterExists (нарушение UNIQUE по player_id) маппится в понятное сообщение. Сброс FSM.
+8. Тесты: чистая функция расчёта персонажа (Воин + Человек: STR = 16, AC = 10 + Modifier(13)) и переходы FSM без сети.
+Как проверить: пройти диалог целиком. В БД запись (Воин + Человек: STR=16), аватар открывается по avatar_url. Повторный /create_character — отказ. /cancel посреди диалога сбрасывает состояние.
+
+Task 3.7. REST CRUD бестиария
+Что делаем: шаблоны монстров под JWT Мастера.
+Пошаговый план:
+1. internal/domain/bestiary.go (сущность, интерфейс, ErrTemplateNotFound), repository/postgres/bestiary.go, usecase/bestiary.go.
+2. Middleware: Auth + RequireRole(dm).
+3. Эндпоинты: POST /api/v1/bestiary — multipart/form-data. Поля: name, ac, max_hp, xp_reward, stats_json, actions_json, bonus_actions_json (строки с JSON), файл token (необязателен). GET /api/v1/bestiary, GET /api/v1/bestiary/{id} — только шаблоны этого Мастера. PUT /api/v1/bestiary/{id} — multipart; если пришёл новый файл, загрузить его, а старый объект удалить. DELETE /api/v1/bestiary/{id} — удалить запись и (best effort) объект из MinIO.
+4. Ограничить размер тела: http.MaxBytesReader(w, r.Body, 6<<20) перед разбором multipart.
+5. Валидация: name 1–128 рун; ac, max_hp > 0; xp_reward ≥ 0; actions_json и bonus_actions_json разбираются в []rules.Action, у каждого действия непустое name, damage_formula проходит dice.Parse, attack_bonus в разумных пределах; stats_json содержит все 6 характеристик.
+6. Чужой или несуществующий шаблон → 404.
+7. Тесты usecase: валидация и проверка владельца.
+Как проверить: создать монстра multipart-запросом (Postman или curl.exe -F). GET/PUT/DELETE отрабатывают. Токен монстра открывается по avatar_url. Кривая формула → 400.
+
+Task 3.8. REST — персонажи стола (только чтение)
+Что делаем: Мастер должен видеть, кем играют участники, чтобы собирать бой.
+Пошаговый план:
+1. GET /api/v1/tables/{id}/characters (JWT Мастера, владение столом → иначе 404).
+2. Запрос: участники стола со статусом accepted + LEFT JOIN characters. Ответ: [{player_id, telegram_username, character: {id, name, race, class, level, current_hp, max_hp, ac} | null}].
+Как проверить: у принявшего инвайт игрока без персонажа character: null; после /create_character — данные персонажа.
+
+DoD Спринта 3.
+- MinIO запущен, валидирует.
+- Правила загружаются из JSON.
+- Игрок собирает персонажа в Telegram.
+- Мастер создаёт шаблоны монстров.
+
+Спринт 4. Боевой движок, Event Bus, polling, XP
+Длительность: 2 недели.
+Фокус: боевой цикл, real-time события через polling, начисление опыта.
+
+Что изменилось относительно v2.2.
+Архитектурные решения (отличаются от ТЗ; при несогласии поправить до начала спринта):
+- PostgreSQL — единственный источник истины для состояния боя: раунд, текущий ход, порядок очереди и экономика действий хранятся в БД (колонки), а не в Redis. Причина: ТЗ требует SSOT и транзакции (TD-04); состояние из двух хранилищ нельзя обновить атомарно. Redis в MVP — только буфер событий для polling. Кэш очереди в Redis отложен (TD-24).
+- Снимок при создании боя: в encounter_entities копируется в том числе xp_reward. Иначе правка или удаление шаблона монстра после спавна ломает подсчёт XP.
+- Статус сущности (active / unconscious / dead) хранится явно (TD-06).
+- Event Bus с глобальными подписчиками: три подписчика регистрируются один раз при старте и сами фильтруют по encounter_id. События публикуются только после успешного commit.
+- Финал боя не удаляет Redis-ключи событий. Ключи живут по TTL, который продлевается на каждом событии (TD-16).
+- Нужны ход и атака от имени игрока из Telegram: новая Task 4.9.
+- Порядок задач изменён: polling теперь 4.6, после боевого цикла, чтобы проверять его на реальном бою.
+Правила D&D (официальные, раз в ТЗ не менялись): попадание, если бросок ≥ AC; натуральная 1 — промах; натуральная 20 — попадание и крит (кубики урона ×2); рост HP на уровне — среднее значение кубика + модификатор CON.
+Исправления ошибок v2.2: модификатор DEX через Modifier (не /2); HP игроков восстанавливаются после боя всем, а не только при Level Up (TD-01); явный ключ сортировки инициативы (TD-03); транзакции (TD-04); идемпотентный /finish (TD-05).
+
+Task 4.1. Миграция 000005 — бои, сущности, лог бросков
+Пошаговый план:
+1. internal/migrations/sql/000005_create_encounters_and_logs.up.sql и .down.sql.
+2. encounters, encounter_entities, dice_rolls_log — по разделу 2.2 ТЗ.
+3. down.sql в обратном порядке.
+Как проверить: миграция применяется при старте (версия 5). Второй незавершённый бой на тот же стол, невалидный entity_type или status — ошибки.
+
+Task 4.2. Event Bus + DB Log Subscriber
+Пошаговый план:
+1. internal/eventbus/event.go: Type (DiceRoll, Damage, TurnChange, EncounterStart, EncounterFinish); Event{Type, EncounterID, Payload any, CreatedAt}. Для каждого типа — своя структура payload (например, DiceRollPayload{ActorName, ActionName, RollType, Formula, Detail}).
+2. internal/eventbus/bus.go: Bus; Subscribe(name string, buffer int) <-chan Event (буфер по умолчанию 256); Publish(e Event) — неблокирующий: для каждого подписчика select с default. При переполнении писать Warn с именем подписчика и типом события (TD-15). Close() закрывает каналы подписчиков.
+3. internal/eventbus/subscribers/db_log.go: читает канал; события DiceRoll пишет в dice_rolls_log. Ошибки записи логируются, подписчик не падает.
+4. Остановка (TD-13): подписчики завершаются, когда Close() закрыл их канал и он опустел; run() ждёт их через sync.WaitGroup перед выходом.
+5. Правило для всех usecase: Publish вызывается после успешного commit транзакции.
+Как проверить: unit-тесты: два подписчика получают событие; подписчик, который не читает, не блокирует Publish (300 событий при буфере 256 — быстро и с предупреждениями); после Close() горутины завершаются.
+
+Task 4.3. Создание боя (preparing)
+Пошаговый план:
+1. POST /api/v1/encounters, тело: {"table_id": "...", "monsters": [{"template_id": "...", "count": 2}], "player_ids": ["..."]}. player_ids — id пользователей-игроков.
+2. Проверки (все до записи): стол принадлежит Мастеру (404 иначе); каждый игрок — участник стола со статусом accepted и у него есть персонаж (400 со списком проблемных); шаблоны принадлежат Мастеру (404 иначе); count 1–20, игроков ≥ 1, всего сущностей ≤ 30; на столе нет незавершённого боя (конфликт по частичному индексу → 409).
+3. Создание в одной транзакции (pgx.Tx): запись encounters (preparing) и все encounter_entities: игрок — копия из characters (current_hp, max_hp, ac, stats_json, actions_json, bonus_actions_json), source_id = characters.id, xp_reward = 0; монстр — count копий шаблона с именами <Name> #1, <Name> #2… (нумерация отдельно для каждого шаблона), xp_reward из шаблона.
+4. Ответ 201 с боем и списком сущностей. Дополнительно GET /api/v1/encounters/{id} (владелец): бой + сущности в порядке turn_position (до старта — по имени).
+5. Тесты usecase с mock: нумерация имён, отказ при не принявшем игроке, снимок xp_reward.
+Как проверить: POST с 2 гоблинами и 1 игроком → в БД encounters в preparing, 3 сущности с заполненными JSONB и xp_reward у гоблинов. Повторный POST на тот же стол → 409.
+
+Task 4.4. Инициатива и старт боя
+Пошаговый план:
+1. POST /api/v1/encounters/{id}/start (Мастер-владелец).
+2. Транзакция: SELECT status FROM encounters WHERE id=$1 FOR UPDATE — блокировка строки боя не даёт двум параллельным запросам запустить бой дважды. Статус не preparing → 409.
+3. Для каждой сущности последовательно: 1d20 + Modifier(DEX) (DEX берётся из stats_json); записать initiative_score. Кубики бросает Roller, который передан зависимостью (в тестах подставляется фиксированный).
+4. Сортировка в Go явным компаратором (sort.SliceStable), а не сравнением строк entity_type: 1) initiative_score по убыванию; 2) Modifier(DEX) по убыванию; 3) игрок раньше монстра (явный ранг: игрок 0, монстр 1); 4) display_name для детерминизма. Компаратор вынести в функцию и покрыть table-driven тестом.
+5. Записать turn_position (0…n−1), encounters.status='active', round=1, current_turn=0. Commit.
+6. После commit публиковать: DiceRoll на каждый бросок, EncounterStart (с порядком очереди), TurnChange (первый ходящий).
+Как проверить: бой с игроком и монстром при одинаковом DEX и принудительно равной инициативе (mock-Roller в тесте): игрок выше монстра. Второй /start → 409. Броски в dice_rolls_log.
+
+Task 4.5. Боевой цикл: атака, HP, смена хода
+Пошаговый план:
+1. POST /api/v1/encounters/{id}/actions/attack, тело {"actor_id","target_id","action_name"}. Сигнатура usecase: Attack(ctx, requester Identity, encounterID, req), где Identity{UserID, Role}. Мастер действует за любую сущность своего стола; игрок (Task 4.9) только за свою: characters.player_id == requester.UserID, иначе 403.
+2. Транзакция с блокировкой строки боя (FOR UPDATE): все действия одного боя выполняются последовательно.
+3. Проверки: бой active (409); актёр и цель принадлежат бою (404); actor.turn_position == encounters.current_turn и актёр active (409 «не ход этой сущности»); цель не dead; цель ≠ актёр (400).
+4. Действие ищется по action_name сначала в actions_json (тратит Action), затем в bonus_actions_json (тратит Bonus Action). Не найдено → 400; слот уже использован → 409.
+5. Бросок: d20; натуральная 1 — промах; натуральная 20 — попадание и крит; иначе d20 + attack_bonus ≥ target.ac — попадание. При попадании урон Roll(damage_formula) (при крите .Crit()); hp = max(0, hp − урон).
+6. hp == 0: монстр → dead, игрок → unconscious. Поставить флаг использованного слота, commit.
+7. После commit: DiceRoll (атака), DiceRoll (урон, если попал), Damage{target, damage, hp_left, status, all_monsters_dead}.
+8. POST /api/v1/encounters/{id}/turn/end (Мастер; игрок — Task 4.9): та же блокировка; найти следующую сущность по turn_position со статусом active, пропуская dead и unconscious; при переходе через конец очереди round++; если активных нет → 409 «нет активных участников, завершите бой». Обнулить action_used и bonus_action_used у той, чей ход начинается. После commit: TurnChange{round, entity}.
+9. Тесты usecase с mock-репозиторием и фиксированными кубиками: промах, попадание, крит, смерть монстра, потеря сознания игрока, пропуск хода мёртвого, повторное использование Action (409), чужой ход (409).
+Как проверить: провести раунд через curl.exe. HP цели уменьшилось; броски в dice_rolls_log; мёртвый монстр пропускается; после круга round вырос.
+
+Task 4.6. Redis Event Buffer + polling-эндпоинт
+Пошаговый план:
+1. go get github.com/redis/go-redis/v9; подключение в run() с Ping; закрытие при остановке.
+2. subscribers/redis_buffer.go: для каждого события сериализовать JSON {"type","encounter_id","payload","created_at"} и в одном pipeline выполнить RPUSH encounter:<id>:events <json> и EXPIRE encounter:<id>:events 86400. TTL продлевается на каждом событии. Ошибки Redis логируются, подписчик продолжает работу.
+3. GET /api/v1/encounters/{id}/events?after=<index> (JWT Мастера, бой принадлежит его столу иначе 404). after — целое ≥ 0 (по умолчанию 0), иначе 400.
+4. LRANGE encounter:<id>:events <after> -1. Ответ: {"events": [...], "next_index": after + len(events)}. Если список истёк по TTL и клиент пришёл с after, который больше длины списка, вернуть next_index = LLEN.
+5. Тесты: подписчик и хендлер против miniredis (github.com/alicebob/miniredis/v2) или mock-интерфейса; проверить after=0, after=N, пустой результат.
+Как проверить: запустить цикл опроса (PowerShell):
+$i = 0
+while ($true) {
+  r=curl.exe-s"http://localhost:8080/api/v1/encounters/id/events?after=$i" `
+    -H "Authorization: Bearer $token" | ConvertFrom-Json
+  $r.events | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 5 }
+  $i = $r.next_index
+  Start-Sleep -Seconds 1
+}
+Пока цикл работает, выполнять атаки: события появляются по одному, без повторов.
+
+Task 4.7. Telegram Notification Publisher
+Пошаговый план:
+1. subscribers/telegram.go: подписчик получает события, находит Telegram-id игроков этого боя (репозиторий: encounter_entities типа player → characters → users.telegram_id) и отправляет сообщения через интерфейс нотификатора (как в Task 2.6).
+2. Форматирование в отдельной чистой функции formatEvent(e) string (на русском): начало боя и порядок ходов; «Гоблин #1 атакует Арвена: попадание, 7 урона (HP: 5/12)»; «Ход: <имя>, раунд N»; финал боя с XP.
+3. Отправка последовательно с небольшой паузой; ошибки вроде «бот заблокирован пользователем» логируются как warn, не роняют подписчика.
+4. Тесты formatEvent на примерах каждого типа события.
+Как проверить: запустить бой с игроком: в Telegram приходят сообщения о старте, атаках и смене хода.
+
+Task 4.8. Финал боя и XP
+Пошаговый план:
+1. POST /api/v1/encounters/{id}/finish (Мастер-владелец).
+2. Идемпотентность (TD-05) атомарным UPDATE, а не «прочитал статус, потом записал»: UPDATE encounters SET status='finished', finished_at=now() WHERE id=$1 AND status='active'. Затронуто 0 строк → 409. Начисление XP выполняется только после успешного UPDATE.
+3. Всё в одной транзакции: totalXP = SUM(xp_reward) сущностей monster со status='dead' из снимка в encounter_entities; для каждого игрока боя (включая потерявших сознание): xp += totalXP (полностью, по ТЗ); newLevel = rules.LevelForXP(xp); за каждый полученный уровень max_hp += max(1, hit_die/2 + 1 + Modifier(CON)); всем игрокам боя: current_hp = max_hp (TD-01), независимо от Level Up.
+4. Redis-ключи событий не удалять (см. решение выше).
+5. После commit: EncounterFinish{total_xp, players: [{name, xp_gained, level_before, level_after, hp}]}.
+6. Тесты usecase: XP из снимка при удалённом шаблоне; повторный вызов → 409 и XP не удваивается; повышение сразу на два уровня; восстановление HP игроку без Level Up; потерявший сознание игрок тоже получает XP.
+Как проверить: бой на 300 XP (2 гоблина по 150). После /finish каждому игроку +300 XP, уровень растёт при достижении порога, current_hp = max_hp. Второй /finish → 409, XP не изменился. В polling пришёл EncounterFinish.
+
+Task 4.9. Telegram — ход игрока кнопками
+Что делаем: игрок управляет своим ходом из Telegram.
+Пошаговый план:
+1. Когда наступает ход игрока (TurnChange), сообщение из Task 4.7 идёт с кнопками «Атаковать» и «Закончить ход».
+2. Цепочка callback (индексы вместо имён, чтобы уложиться в лимит callback_data 64 байта): atk:<encounter_id> → показать действия персонажа (act:<encounter_id>:<action_idx>; бонусные действия — в конце списка); act:<encounter_id>:<action_idx> → показать живые цели (tgt:<encounter_id>:<action_idx>:<turn_position>); tgt:... → вызвать Attack с Identity{UserID: игрок, Role: player}; end:<encounter_id> → EndTurn от игрока.
+3. Игрок определяется по telegram_id. Сервер проверяет всё сам: чей ход, чей актёр, какой слот свободен. Данным из callback_data не доверяем.
+4. После действия сообщение редактируется (результат атаки); общие уведомления всем игрокам идут через обычный Publisher.
+5. Ошибки usecase (не твой ход, слот занят) — AnswerCallbackQuery с понятным текстом.
+Как проверить: бой с одним игроком и одним монстром. Игрок атакует и завершает ход кнопками; попытка нажать «Атаковать» вне своего хода даёт alert; Мастер видит все события в polling.
+
+DoD Спринта 4.
+- Бой создаётся с нумерованными копиями монстров.
+- Броски и урон корректны.
+- События доступны через polling-эндпоинт и приходят в Telegram.
+- XP начисляется, Level Up срабатывает.
+
+Спринт 5. Swagger UI, контейнеризация, CI, документация
+Длительность: 2 недели.
+Фокус: интерактивная документация, запуск всего стека одной командой, CI, README.
+
+Что изменилось относительно v2.2:
+- Postman: токен сохраняется в скрипте Tests (post-response) запроса login, а не Pre-request.
+- .dockerignore не должен исключать docs/: swag init создаёт в docs/ Go-пакет (docs.go), без него сборка упадёт.
+- Версия Go в Dockerfile и README должна быть не ниже версии из go.mod (сейчас 1.26.2), а не 1.23.
+- Внутри контейнера хосты БД, Redis и MinIO другие (postgres, redis, minio), их нужно переопределить в compose.
+- Путь к правилам задаётся RULES_DIR (TD-08).
+- Новая 5.5: CI на GitHub Actions (TD-11).
+- Multipart в Swagger описан явно (TD-21).
+
+Task 5.1. Swagger UI / OpenAPI
+Пошаговый план:
+1. go install github.com/swaggo/swag/cmd/swag@latest, go get github.com/swaggo/http-swagger.
+2. Общие аннотации в main.go: @title, @version, @BasePath /api/v1, схема безопасности BearerAuth (@securityDefinitions.apikey, in header, name Authorization; в UI вводится как Bearer <token>).
+3. Аннотировать каждый хендлер: @Summary, @Tags, @Accept, @Produce, @Param, @Success, @Failure, @Security BearerAuth. Для multipart: @Accept mpfd и @Param token formData file false "...", остальные поля как formData (Task 3.7).
+4. Генерация: swag init -g cmd/app/main.go. Результат (docs/docs.go, swagger.json, swagger.yaml) коммитится в репозиторий.
+5. В main.go импортировать пакет docs пустым импортом _ ".../docs", смонтировать /swagger/* в chi через httpSwagger.Handler.
+6. Проверить, что видны все группы: auth, tables, characters (3.8), bestiary, encounters, events.
+Как проверить: http://localhost:8080/swagger/index.html. Login через UI → токен → Authorize → защищённые ручки вызываются. Загрузка токена монстра через форму в UI работает.
+
+Task 5.2. Postman-коллекция
+Пошаговый план:
+1. docs/postman_collection.json: папки Auth, Tables, Characters, Bestiary, Encounters, Events. Для каждого запроса метод, URL, тело, пример ответа.
+2. Переменные окружения: {{base_url}}, {{jwt}}, {{table_id}}, {{encounter_id}}, {{next_index}}.
+3. Авторизация на уровне коллекции: Bearer {{jwt}}.
+4. Скрипт Tests запроса login: сохранить token из ответа в jwt. Скрипт Tests запроса events: сохранить next_index. Скрипты создания стола и боя сохраняют id в table_id и encounter_id.
+5. Инструкция по импорту в README.
+Как проверить: импортировать коллекцию, выбрать окружение и прогнать сценарий: login → стол → инвайт → бестиарий → бой → атаки → events → finish. Токены и id подставляются сами.
+
+Task 5.3. Dockerfile
+Пошаговый план:
+1. deploy/Dockerfile, multi-stage: builder — golang:1.26-alpine (тег не ниже версии из go.mod), WORKDIR /src, COPY go.mod go.sum ./, go mod download, COPY . ., CGO_ENABLED=0 go build -o /out/app ./cmd/app; final — alpine:3.20, apk add --no-cache ca-certificates tzdata, пользователь adduser -D -u 10001 appuser, COPY --from=builder /out/app /usr/local/bin/app, COPY --from=builder /src/configs /configs, ENV RULES_DIR=/configs/rules, USER appuser, ENTRYPOINT ["/usr/local/bin/app"].
+2. Миграции уже вшиты в бинарник (embed), отдельно копировать не нужно.
+3. .dockerignore: .git, bin/, tmp/, .env, docs/postman_collection.json. docs/ целиком не исключать.
+4. Без distroless и без оптимизации размера.
+Как проверить: docker build -t vtt-app -f deploy/Dockerfile .. Запуск docker run --rm --env-file .env vtt-app — правила находятся, процесс работает от appuser (docker run --rm --entrypoint id vtt-app).
+
+Task 5.4. Итоговый docker-compose
+Пошаговый план:
+1. Сервис app в deploy/docker-compose.yml: build: {context: .., dockerfile: deploy/Dockerfile}, env_file: ../.env, ports: 8080:8080, restart: unless-stopped.
+2. Переопределить в environment адреса внутри сети Compose (значения environment перекрывают env_file): POSTGRES_HOST=postgres, POSTGRES_PORT=5432, REDIS_HOST=redis, REDIS_PORT=6379, MINIO_ENDPOINT=minio:9000. MINIO_PUBLIC_URL оставить адресом для браузера (http://localhost:9000).
+3. depends_on с condition: service_healthy для postgres, redis, minio. Healthcheck самого приложения: wget -qO- http://localhost:8080/healthz (wget есть в alpine).
+4. Секреты только через .env; .env.example содержит все нужные переменные (включая TELEGRAM_BOT_TOKEN, JWT_SECRET, RULES_DIR).
+Как проверить: dc up --build -d → все сервисы healthy, app стартовал после остальных. curl.exe http://localhost:8080/healthz → ok. В логах приложения «migrations applied».
+
+Task 5.5. CI (GitHub Actions)
+Пошаговый план:
+1. .github/workflows/ci.yml, триггер: push и pull request в main.
+2. Шаги: checkout → actions/setup-go с go-version-file: go.mod → go vet ./... → go test ./... → golangci-lint (официальный action) → docker build -f deploy/Dockerfile ..
+3. Интеграционные тесты с реальной БД (TD-10) пока не входят в CI.
+4. Бейдж статуса в README.
+Как проверить: пуш в ветку: зелёная сборка во вкладке Actions. Намеренно сломать тест — сборка краснеет.
+
+Task 5.6. Ручной E2E-чеклист
+Пошаговый план: пройти сценарий, каждый шаг зафиксировать с ожидаемым результатом (для README).
+1. Развёртывание: cp .env.example .env (PowerShell: Copy-Item .env.example .env), заполнить, dc up --build -d, dc ps — все healthy.
+2. Мастер: Swagger → register → login → Authorize.
+3. Стол и инвайт: создать стол, пригласить игроков по @username, принять кнопкой.
+4. Персонаж: /create_character у каждого игрока.
+5. Бестиарий: 2–3 шаблона с токенами (multipart).
+6. Бой: создать → /start → цикл опроса events (Task 4.6) → атаки (Swagger и кнопки Telegram) → turn/end → /finish.
+7. Проверки: XP и уровень в БД (SELECT name, level, xp, current_hp, max_hp FROM characters;), повторный /finish → 409, вызов без токена → 401, чужой стол → 404.
+Как проверить: все шаги проходят, скриншоты или логи приложены к README.
+
+Task 5.7. README.md
+Пошаговый план:
+1. Архитектура: ASCII-диаграмма (REST + polling, Telegram, PostgreSQL как SSOT, Redis event buffer, MinIO, Event Bus с тремя подписчиками).
+2. Быстрый старт: требования (Docker; Go версии из go.mod), .env.example, запуск docker compose -f deploy/docker-compose.yml --env-file .env up --build -d (для Windows/PowerShell и bash одинаково), проверка /healthz, ссылка на Swagger.
+3. Руководство Мастера: Swagger UI и Postman, примеры запросов.
+4. Руководство Игрока: /start, /create_character, инвайты, управление в бою.
+5. E2E-чеклист (из 5.6).
+6. Раздел «Решения и ограничения»: XP начисляется полностью каждому игроку; правила атаки и крита официальные; ссылка на docs/TECH_DEBT.md.
+7. Бейдж CI.
+Как проверить: открыть README в предпросмотре; пройти раздел «Быстрый старт» на чистой машине или в чистой папке — команды работают без правок.
+
+DoD Спринта 5.
+- Swagger UI доступен, все эндпоинты документированы.
+- Postman-коллекция в репозитории.
+- Стек запускается через docker-compose up --build.
+- E2E пройдено.
+- README оформлен.
+
+Сводная таблица сроков.
+Спринт 1 — Инфраструктура, БД, логирование, аутентификация DM — 2 недели.
+Спринт 2 — Столы, инвайты, Telegram-каркас — 2 недели.
+Спринт 3 — Кубики, Rules Engine, персонажи, бестиарий, S3 — 2 недели.
+Спринт 4 — Боевой движок, Event Bus, polling, XP — 2 недели.
+Спринт 5 — Swagger UI, контейнеризация, CI, документация — 2 недели.
+
+
+Спринт 1. Инфраструктура, БД (SSOT), логирование, аутентификация DM
+Длительность: 2 недели.
+Фокус: фундамент приложения, окружение, схема БД, REST API аутентификации Мастера.
+
+Task 1.1. Каркас Go-проекта и Clean Architecture
+Что делаем: инициализируем Go-модуль и раскладываем архитектуру по слоям.
+Пошаговый план:
+1. go mod init <module-path> в корне проекта.
+2. Структура каталогов:
+   cmd/app/ — точка входа
+   internal/domain/ — сущности и интерфейсы репозиториев
+   internal/usecase/ — бизнес-логика
+   internal/repository/postgres/ — реализации репозиториев
+   internal/transport/rest/ — HTTP-хэндлеры
+   internal/transport/rest/middleware/ — middleware
+   internal/transport/telegram/ — Telegram-бот
+   internal/config/ — конфигурация
+   internal/pkg/logger/, internal/pkg/token/, internal/pkg/hasher/
+   internal/pkg/storage/, internal/pkg/rules/, internal/pkg/dice/
+   internal/eventbus/ — шина событий
+   internal/migrations/ — SQL-миграции и загрузчик
+   configs/rules/ — JSON-правила
+   deploy/ — docker-compose и Dockerfile
+   docs/ — Postman-коллекция, TECH_DEBT
+3. Базовые зависимости: pgx/v5, chi/v5, golang-jwt/v5, cleanenv, golang-migrate, google/uuid, bcrypt.
+Как проверить: минимальный cmd/app/main.go с fmt.Println("Server initialized"). go run ./cmd/app — без ошибок.
+
+Task 1.2. PostgreSQL 16 и Redis 7 в Docker Compose
+Что делаем: готовим локальные базы данных.
+Пошаговый план:
+1. .env.example: POSTGRES_*, REDIS_*, JWT_SECRET, JWT_TTL, APP_PORT, LOG_LEVEL.
+2. deploy/docker-compose.yml с сервисами postgres:16-alpine и redis:7-alpine.
+3. Пробросить порты, настроить healthcheck, объявить volumes.
+4. .gitignore — исключить .env, bin/, tmp/.
+Как проверить: cp .env.example .env, затем cd deploy && docker compose up -d. docker compose ps — оба healthy.
+
+Task 1.3. Конфигурация, slog, graceful shutdown
+Что делаем: чтение .env, JSON-логи, безопасная остановка.
+Пошаговый план:
+1. Установить cleanenv и godotenv.
+2. internal/config/config.go — структура Config с секциями App, DB, Redis, JWT, Telegram. Теги env-required:"true". Метод DSN().
+3. internal/pkg/logger/logger.go — slog JSON, функции WithRequestID, RequestIDFromContext, FromContext.
+4. cmd/app/main.go — вынести всю логику в func run() error. main только вызывает run() и при ошибке пишет её в лог и делает os.Exit(1).
+5. signal.NotifyContext, HTTP-сервер в горутине, srv.Shutdown с таймаутом 10 секунд. При падении сервера — stop() и graceful shutdown.
+6. Middleware RequestID: генерирует UUID, кладёт в контекст, добавляет в заголовок ответа X-Request-ID.
+Как проверить: go run ./cmd/app — JSON-логи. curl localhost:8080/healthz → ok. Ctrl+C → shutdown signal received → http server stopped.
+
+Task 1.4. Миграция 000001 — users
+Что делаем: схема users для игроков и мастеров.
+Пошаговый план:
+1. internal/migrations/sql/000001_create_users_table.up.sql и .down.sql.
+2. В up.sql: CREATE EXTENSION IF NOT EXISTS "uuid-ossp"; таблица users (id, telegram_id, telegram_username, username, password_hash, role, created_at) с типами по разделу 2.2 ТЗ; CHECK users_role_check: role IN ('player','dm'); CHECK users_role_consistency (см. ТЗ); частичные индексы по telegram_id, telegram_username, username.
+3. В down.sql: DROP TABLE IF EXISTS users CASCADE.
+Как проверить: применить вручную через psql. \d users. Тестовые вставки: корректные игрок и мастер — успех; игрок без telegram_id — ошибка; мастер без password_hash — ошибка.
+
+Task 1.5. Утилиты Hasher и Token
+Что делаем: пакеты для безопасности.
+Пошаговый план:
+1. Установить golang.org/x/crypto/bcrypt и golang-jwt/jwt/v5.
+2. internal/pkg/hasher/hasher.go: HashPassword, CheckPassword.
+3. internal/pkg/token/token.go: Claims (UserID, Role, RegisteredClaims), GenerateToken, ValidateToken (HS256).
+4. Unit-тесты для обоих пакетов.
+Как проверить: go test ./internal/pkg/... — зелёные.
+
+Task 1.6. PostgreSQL-репозиторий пользователей
+Что делаем: DAL на pgx/v5.
+Пошаговый план:
+1. Установить pgx/v5 и pgxpool.
+2. internal/repository/postgres/db.go — NewPool с параметрами пула, Ping с таймаутом.
+3. internal/domain/user.go: User с полями ID, TelegramID *int64, TelegramUsername *string, Username *string, PasswordHash *string, Role, CreatedAt; Role с константами; ошибки ErrUserNotFound, ErrUserAlreadyExists; интерфейс UserRepository: Create, GetByID, GetByUsername, GetByTelegramID, GetByTelegramUsername, Update.
+4. internal/repository/postgres/user.go — реализация. Маппинг: pgx.ErrNoRows → ErrUserNotFound; код 23505 → ErrUserAlreadyExists.
+Как проверить: временный вызов из main.go: создать мастера, найти по username, попробовать дубликат — ErrUserAlreadyExists.
+
+Task 1.7. Usecase, REST-хэндлеры, Auth Middleware
+Что делаем: auth-логика и роутинг.
+Пошаговый план:
+1. internal/usecase/auth.go: RegisterDM, LoginDM, GetMe.
+2. internal/transport/rest/handler/auth.go: POST /api/v1/auth/register, POST /api/v1/auth/login (возвращает { "token": "..." }), GET /api/v1/me.
+3. internal/transport/rest/middleware/auth.go: Auth(secret) — читает Authorization: Bearer, валидирует, кладёт user_id и role в контекст.
+4. internal/transport/rest/middleware/context.go: WithUserID, UserIDFromContext, WithRole, RoleFromContext.
+5. internal/transport/rest/middleware/access_log.go: логирование запросов с request_id.
+6. internal/transport/rest/router.go: chi-роутер, RequestID, AccessLog, chimw.Recoverer. Публичные /api/v1/auth/*, защищённая группа с GET /api/v1/me.
+Как проверить: через curl.exe: register → 201; login → JWT; /me с токеном → данные; без токена → 401. Для несуществующего пользователя GET /me → 401.
+
+Task 1.8. Auto-migrate через embed.FS
+Что делаем: миграции внутри бинарника.
+Пошаговый план:
+1. Установить golang-migrate/v4 с драйверами postgres и iofs.
+2. internal/migrations/migrations.go: //go:embed sql/*.sql, var FS embed.FS.
+3. Run(dsn string) error — открывает iofs, m.Up(), игнорирует ErrNoChange.
+4. Вызвать в main.go до инициализации пула.
+Как проверить: docker compose down -v && up -d. go run ./cmd/app. Логи: «migrations applied». \dt — таблица есть. Повторный запуск — без ошибок.
+
+DoD Спринта 1.
+- Postgres + Redis поднимаются.
+- Миграции применяются автоматически.
+- Мастер регистрируется, логинится, получает JWT.
+- JSON-логи с x-request-id.
+- Graceful shutdown работает.
+
+
+Спринт 2. Столы, инвайты, Telegram-каркас
+Длительность: 2 недели.
+Фокус: связать REST Мастера с Telegram-ботом: стол → инвайт по @username → игрок принимает или отклоняет.
+
+Что изменилось относительно v2.2:
+- Новая 2.1 — хвосты Спринта 1: run() error, лог 500, настоящий /me.
+- telegram_username нормализуется (lowercase, без @).
+- Инвайт: описаны 404, 409 и 502; при сбое Telegram запись откатывается.
+- Callback: атомарный UPDATE ... WHERE status='pending', обработка устаревших кнопок (TD-19).
+- Graceful shutdown бота (TD-13). GetOrCreatePlayer не затирает username пустым значением (TD-14).
+- Миграция теперь 000003.
+- Новая 2.9 — подготовка репозитория к публикации.
+
+Task 2.1. Хвосты Спринта 1
+Что делаем: закрываем три пункта техдолга, пока код небольшой.
+Пошаговый план:
+1. cmd/app/main.go: вынести всю логику в func run() error. main вызывает run() и при ошибке пишет её в лог и делает os.Exit(1). Причина: os.Exit не выполняет defer, поэтому defer pool.Close() внутри main не сработает.
+2. respondError (или аналог в хендлерах): для статуса ≥ 500 логировать исходную ошибку через логгер из контекста (logger.FromContext(ctx).Error(...)), клиенту отдавать общий текст без деталей.
+3. GET /api/v1/me: AuthUseCase.GetMe(ctx, userID) → UserRepository.GetByID → userResponse. Если пользователя нет — 401.
+4. Тесты: для GetMe написать table-driven тест с mock-репозиторием.
+Как проверить:
+- /me с токеном возвращает данные из БД.
+- dc stop postgres и запрос → клиент получает 500 без деталей, в логе есть строка error с request_id. Потом dc start postgres.
+- go test ./... зелёный.
+
+Task 2.2. Подключение Telegram-бота
+Что делаем: long-polling через github.com/go-telegram/bot с корректной остановкой.
+Пошаговый план:
+1. Создать бота у @BotFather, токен положить в .env как TELEGRAM_BOT_TOKEN; в .env.example — заглушка.
+2. go get github.com/go-telegram/bot.
+3. internal/config: Telegram{BotToken string} с env:"TELEGRAM_BOT_TOKEN" env-required:"true". Токен никогда не пишем в логи.
+4. internal/transport/telegram/bot.go: New(token string, log *slog.Logger, players PlayerService) (*Bot, error) и Start(ctx context.Context). Start блокируется до ctx.Done(). PlayerService описывается здесь же; его реализация появится в Task 2.3.
+5. В run(): запустить Start в горутине под общим ctx, добавить sync.WaitGroup. Перед выходом из run() дождаться остановки бота (wg.Wait()).
+6. Пока зарегистрировать только default-хендлер, который логирует входящее сообщение.
+Как проверить: написать боту, в логе появится запись. Ctrl+C: сначала «telegram bot stopped», потом «server stopped», процесс завершается сам без зависших горутин.
+
+Task 2.3. /start и telegram_username
+Что делаем: регистрация игрока при первом /start.
+Пошаговый план:
+1. NormalizeTelegramUsername(s string) string: убрать ведущий @, strings.ToLower, strings.TrimSpace. Положить в internal/domain.
+2. internal/usecase/player.go: GetOrCreatePlayer(ctx, telegramID int64, username string): GetByTelegramID нашёл игрока — если username != "" и он отличается от сохранённого, вызвать Update; если пришёл пустой username, ничего не менять (не затирать NULL-ом существующее значение). Не нашёл — создать с ролью player. ErrUserAlreadyExists при записи username (ник занят другим пользователем): залогировать warn, попытаться сохранить игрока без username.
+3. internal/transport/telegram/handlers.go: handleStart (приветствие + подсказка «Мастер пригласит вас за стол по @username»). Регистрация хендлеров — через bot.WithMessageTextHandler в telegram.New (Task 2.2).
+4. Table-driven тесты usecase с mock-репозиторием: новый игрок, смена ника, пустой ник, конфликт ника.
+Как проверить: /start → запись с telegram_id, telegram_username в нижнем регистре, role=player, password_hash=NULL. Сменить ник и снова /start → username в БД обновился. Убрать ник у аккаунта, снова /start → в БД остался прежний.
+
+Task 2.4. Миграция 000003 — tables и table_members
+Что делаем: DDL для столов и участников.
+Пошаговый план:
+1. Файлы internal/migrations/sql/000003_create_tables_and_members.up.sql и .down.sql.
+2. tables: id (UUID PK, генерация как в 000001), dm_id (FK → users.id ON DELETE CASCADE), name VARCHAR(128) NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(). Индекс idx_tables_dm_id.
+3. table_members: id, table_id (FK → tables.id CASCADE), player_id (FK → users.id CASCADE), status VARCHAR(16) NOT NULL DEFAULT 'pending' с CHECK IN ('pending','accepted','declined'), created_at. UNIQUE (table_id, player_id). Индексы по table_id и player_id.
+4. Имя tables в PostgreSQL допустимо без кавычек.
+5. dm_id не гарантируется FK: это проверяет usecase (Task 2.5).
+6. down.sql: в обратном порядке (table_members, затем tables).
+Как проверить: go run ./cmd/app → в логе «migrations applied». dc exec postgres psql -U go_dnd_user -d go_dnd -c "\d table_members". Невалидный статус и дубликат пары (table_id, player_id) дают ошибки.
+
+Task 2.5. REST создания стола + RequireRole
+Что делаем: POST /api/v1/tables под JWT Мастера.
+Пошаговый план:
+1. internal/domain/table.go: Table, TableMember, тип MemberStatus с константами, ошибки ErrTableNotFound, ErrMemberExists. Интерфейс TableRepository: Create, GetByID, ListByDM.
+2. internal/repository/postgres/table.go: реализация, ошибки через mapPgError.
+3. middleware.RequireRole(role domain.Role): читает роль из контекста (её кладёт Auth), при несовпадении отвечает 403. Навесить на группу /api/v1/tables.
+4. internal/usecase/table.go: CreateTable(ctx, dmID, name). Имя: strings.TrimSpace, длина 1–128 рун (utf8.RuneCountInString), иначе ErrInvalidInput.
+5. handler/table.go: CreateTable принимает {"name": "..."}, dm_id берёт из контекста, отвечает 201 и {id, name, created_at}.
+6. Тесты: usecase (валидация имени) и RequireRole (через httptest).
+Как проверить:
+curl.exe -i -X POST http://localhost:8080/api/v1/tables `
+  -H "Authorization: Bearer $token" `
+  -H "Content-Type: application/json" `
+  -d '{"name":"Подземелье Дракона"}'
+Ожидается 201. Без токена — 401. В БД запись с правильным dm_id.
+
+Task 2.6. REST инвайта
+Что делаем: POST /api/v1/tables/{id}/invites.
+Пошаговый план:
+1. В usecase объявить интерфейс InviteNotifier { SendInvite(ctx, telegramID int64, tableName string, tableID uuid.UUID) error }. Реализация живёт в transport/telegram/notifier.go. Так usecase не зависит от Telegram.
+2. TableMemberRepository: Create, Delete(ctx, tableID, playerID), GetByTableAndPlayer, UpdateStatus (Task 2.7), ListMembers (Task 2.8).
+3. usecase/invite.go: InvitePlayer(ctx, dmID, tableID, telegramUsername): NormalizeTelegramUsername, проверка ^[a-z0-9_]{5,32}$, иначе ErrInvalidInput (400); стол существует и принадлежит dmID, иначе ErrTableNotFound (404; для чужого стола тоже 404, чтобы не раскрывать существование); GetByTelegramUsername. Не найден → ErrPlayerNotFound (404) с текстом «Игрок не найден. Попросите его написать боту /start»; TableMemberRepository.Create со статусом pending. Дубликат → ErrMemberExists (409, для любого существующего статуса); notifier.SendInvite. Если Telegram вернул ошибку, удалить созданную запись (Delete) и вернуть ErrNotifyFailed (502). Если и Delete не удался, залогировать.
+4. notifier.go: сообщение «Мастер приглашает вас за стол «<name>»» и две inline-кнопки. callback_data: invite:accept:<table_id> и invite:decline:<table_id> (длина 50 байт, лимит Telegram 64).
+5. Тесты usecase с mock-репозиториями и mock-нотификатором: успех, стол не найден, игрок не найден, дубликат, сбой Telegram (запись удалена).
+Как проверить: POST с {"telegram_username":"@your_nick"} → игроку приходит сообщение с двумя кнопками, в БД pending. Повторный POST → 409. Несуществующий ник → 404.
+
+Task 2.7. Callback-хэндлеры Telegram
+Что делаем: обработка нажатий кнопок инвайта.
+Пошаговый план:
+1. Зарегистрировать хэндлер callback-запросов с префиксом invite:. Проверить по документации версии библиотеки из go.mod, какой именно тип и режим совпадения (prefix) она предлагает.
+2. Парсить callback_data строго: ровно 3 части через :, действие ∈ {accept, decline}, table_id — валидный UUID. Всё остальное игнорировать с логом.
+3. Игрок находится по telegram_id (GetByTelegramID).
+4. TableMemberRepository.UpdateStatus(ctx, tableID, playerID, newStatus) выполняет UPDATE ... SET status=3WHEREtable_i d=1 AND player_id=$2 AND status='pending' и проверяет число затронутых строк. 0 строк → ErrInviteNotActual. Так двойной клик безопасен.
+5. Всегда вызывать AnswerCallbackQuery, иначе у пользователя крутится «часики». На ErrInviteNotActual — ответ с show_alert «Приглашение уже неактуально».
+6. При успехе — EditMessageText: «Вы приняли/отклонили приглашение за стол «...»», без кнопок.
+7. Тест UpdateStatus с mock и (по желанию) parse-функции callback_data.
+Как проверить: «Принять» → сообщение меняется, status='accepted'. Новый инвайт и «Отклонить» → declined. Нажать кнопку на уже обработанном сообщении → alert, БД не меняется.
+
+Task 2.8. REST просмотра столов и участников
+Что делаем: GET /api/v1/tables и GET /api/v1/tables/{id}/members.
+Пошаговый план:
+1. TableRepository.ListByDM, TableMemberRepository.ListMembers (JOIN на users за telegram_username).
+2. Usecase проверяет владение столом: чужой или несуществующий → 404.
+3. Хендлеры: список столов [{id, name, created_at}]; участники [{player_id, telegram_username, status}]. Пустые списки → [].
+4. Пагинацию пока не делаем (TD-17).
+Как проверить: GET /api/v1/tables → массив. GET /api/v1/tables/<id>/members → участники со статусами. Чужой стол → 404.
+
+Task 2.9. Подготовка репозитория к публикации
+Что делаем: делаем репозиторий публичным без утечки секретов. Выполнить до начала откликов на вакансии.
+Пошаговый план:
+1. Проверить, что .env никогда не попадал в историю:
+   git log --all --oneline -- .env
+   git log --all -p | Select-String -Pattern "TELEGRAM_BOT_TOKEN=\S+|JWT_SECRET=\S+|POSTGRES_PASSWORD=\S+"
+   Первая команда должна быть пустой. Во второй смотреть только на заглушки из .env.example. Если найден реальный токен бота, отозвать его в @BotFather (/revoke), а не переписывать историю.
+2. .env.example содержит все переменные, только с заглушками. .gitignore исключает .env.
+3. Минимальный README.md: что это за проект, стек, как запустить (dc up -d, go run ./cmd/app), статус спринтов, ссылка на docs/.
+4. Положить файлы docs/sprint-*.md и docs/TECH_DEBT.md в репозиторий.
+5. Сделать репозиторий публичным (GitHub → Settings → Danger Zone → Change visibility), добавить описание и topics (go, dnd, telegram-bot, postgresql).
+Как проверить: открыть репозиторий в режиме инкогнито: код виден, .env нет, README читается.
+
+DoD Спринта 2.
+- Мастер создаёт стол.
+- Инвайт по @username приходит игроку.
+- Кнопки меняют статус в БД.
+
+
+Спринт 3. Кубики, Rules Engine, персонажи, бестиарий, S3
+Длительность: 2 недели.
+Фокус: правила, файловое хранилище, FSM-конструктор, CRUD бестиария.
+
+Что изменилось относительно v2.2:
+- Кубики и модификатор вынесены в отдельную Task 3.3 (нужны и правилам, и бестиарию, и бою).
+- Формула модификатора (score-10)>>1 вместо /2.
+- Формат actions_json определён явно.
+- AC персонажа: 10 + Modifier(DEX).
+- Проверка картинок: расширение + реальное содержимое файла.
+- Путь к правилам через RULES_DIR (TD-08).
+- Бакет создаёт само приложение.
+- Миграция теперь 000004.
+- Новая 3.8: Мастер видит персонажей стола.
+
+Task 3.1. MinIO в docker-compose
+Что делаем: S3-хранилище локально.
+Пошаговый план:
+1. В deploy/docker-compose.yml сервис minio (образ minio/minio, команда server /data --console-address ":9001"), порты 9000 и 9001, volume, переменные MINIO_ROOT_USER и MINIO_ROOT_PASSWORD из .env.
+2. Healthcheck. В современных образах MinIO есть mc ready local; проверить в документации образа своей версии. Запасной вариант: curl -f http://localhost:9000/minio/health/live, если в образе есть curl.
+3. .env.example: MINIO_ROOT_USER, MINIO_ROOT_PASSWORD, MINIO_ENDPOINT (localhost:9000 для запуска на хосте), MINIO_BUCKET, MINIO_USE_SSL=false, MINIO_PUBLIC_URL (http://localhost:9000).
+4. Бакет автоматически создаёт приложение (Task 3.2).
+Как проверить: dc up -d, dc ps — minio healthy. Консоль на http://localhost:9001, логин из .env.
+
+Task 3.2. S3-адаптер internal/pkg/storage
+Что делаем: клиент MinIO с безопасной валидацией.
+Пошаговый план:
+1. go get github.com/minio/minio-go/v7. StorageConfig в internal/config.
+2. storage.New(cfg, log): создаёт клиента, проверяет бакет (BucketExists), при отсутствии создаёт (MakeBucket) и ставит политику анонимного чтения (GetObject).
+3. ValidateImage(filename string, size int64, head []byte) error: расширение (без учёта регистра) ∈ {.png, .jpg, .jpeg}; size ≤ 5 МБ (5 << 20); тип по содержимому: http.DetectContentType(head) (первые 512 байт) ∈ {image/png, image/jpeg}. Заголовку Content-Type из запроса не доверяем.
+4. Upload(ctx, r io.Reader, size int64, prefix, ext string) (objectName, url string, err error). Имя объекта: <prefix>/<uuid>.<ext>, где prefix — avatars или tokens. Имя файла от пользователя в объект не попадает.
+5. Delete(ctx, objectName). PublicURL(objectName) строит URL из MINIO_PUBLIC_URL.
+6. Интерфейс ImageStorage (Upload, Delete) объявить там, где он используется (FSM, бестиарий), чтобы подменять mock-реализацией в тестах.
+7. Чтение файла: первые 512 байт нужны для проверки, поэтому читать их в буфер, затем склеивать io.MultiReader(bytes.NewReader(head), rest).
+Как проверить: unit-тесты ValidateImage: настоящие сигнатуры PNG (\x89PNG\r\n\x1a\n) и JPEG (\xff\xd8\xff) проходят; %PDF отклонён; .gif отклонён; 6 МБ отклонён; .png с содержимым PDF отклонён. Ручная проверка: Upload небольшого PNG, URL открывается в браузере.
+
+Task 3.3. Кубики и модификатор характеристики
+Что делаем: пакет internal/pkg/dice и функция Modifier. Используются в правилах, бестиарии, инициативе и бою.
+Пошаговый план:
+1. dice.Parse(formula string) (Formula, error): формат XdY, XdY+Z, XdY-Z, dY (X по умолчанию 1). Пробелы вокруг игнорируются. Ограничения: 1 ≤ X ≤ 100, 2 ≤ Y ≤ 1000, |Z| ≤ 1000. Разбор через regexp.
+2. Formula{Count, Sides, Bonus int} с методом Crit() Formula (удваивает Count, Bonus не меняется).
+3. Источник случайности через интерфейс Source { IntN(n int) int }. Продакшн-реализация — на math/rand/v2 (rand.IntN), в тестах — фиксированная.
+4. Roller.Roll(f Formula) Result{Rolls []int, Bonus, Total int}. Список выпавших значений нужен для result_detail.
+5. internal/domain/abilities.go: func Modifier(score int) int { return (score - 10) >> 1 }. Сдвиг знакового числа в Go арифметический, то есть округляет вниз, как требуют правила.
+6. Константы ключей характеристик: STR, DEX, CON, INT, WIS, CHA.
+Как проверить: table-driven тесты. Parse: "1d20", "2d6+3", "d8", "1d20-1" — ок; "abc", "0d6", "1d0", "101d6", "2d6+" — ошибка. Roll с фиксированным источником: детерминированный результат. Modifier: 7→-2, 8→-1, 9→-1, 10→0, 11→0, 12→1, 20→5.
+
+Task 3.4. Загрузчик правил
+Что делаем: JSON-правила и пакет internal/pkg/rules.
+Формат файлов (configs/rules/; идентификаторы — латиница, name — отображаемое имя).
+races.json:
+{"races": [
+  {"id": "human", "name": "Человек", "stat_modifiers": {"STR": 1, "DEX": 1, "CON": 1, "INT": 1, "WIS": 1, "CHA": 1}},
+  {"id": "elf",   "name": "Эльф",    "stat_modifiers": {"DEX": 2}},
+  {"id": "dwarf", "name": "Дварф",   "stat_modifiers": {"CON": 2}}
+]}
+classes.json (остальные классы — по образцу):
+{"classes": [
+  {"id": "fighter", "name": "Воин",
+   "base_stats": {"STR": 15, "DEX": 12, "CON": 14, "INT": 10, "WIS": 10, "CHA": 8},
+   "starting_hp": 12, "hit_die": 10,
+   "actions": [{"name": "Удар мечом", "attack_bonus": 4, "damage_formula": "1d8+2"}],
+   "bonus_actions": [{"name": "Удар щитом", "attack_bonus": 4, "damage_formula": "1d4+2"}]}
+]}
+Схема действия (actions_json и bonus_actions_json в БД — массив таких объектов): {name, attack_bonus, damage_formula}.
+leveling.json (официальные пороги XP):
+{"levels": [
+  {"level": 1, "xp_threshold": 0},     {"level": 2, "xp_threshold": 300},
+  {"level": 3, "xp_threshold": 900},   {"level": 4, "xp_threshold": 2700},
+  {"level": 5, "xp_threshold": 6500},  {"level": 6, "xp_threshold": 14000},
+  {"level": 7, "xp_threshold": 23000}, {"level": 8, "xp_threshold": 34000},
+  {"level": 9, "xp_threshold": 48000}, {"level": 10, "xp_threshold": 64000}
+]}
+Пошаговый план:
+1. RULES_DIR в конфиге (env-default:"configs/rules"); в Docker — /configs/rules (Task 5.3).
+2. rules.Load(dir) (*Rules, error): читает три файла, валидирует: уникальные id; у класса заданы все 6 характеристик; hit_die ∈ {6, 8, 10, 12}; damage_formula проходит dice.Parse; уровни идут подряд с 1, XP строго возрастает, у уровня 1 порог 0.
+3. Геттеры Race(id) (Race, bool), Class(id) (Class, bool), LevelForXP(xp int) int (максимальный уровень, порог которого ≤ xp; выше последнего — последний), а также списки для кнопок в Telegram в стабильном порядке.
+4. Геттеры возвращают копии (в структурах есть map и слайсы).
+5. В run(): ошибка загрузки правил — фатальная.
+Как проверить: unit-тесты на фикстурах в testdata/: корректные файлы; отсутствующий файл; битый JSON; неверная формула; LevelForXP(0)=1, (299)=1, (300)=2, (999999)=10. Убрать файл → приложение не стартует с понятной ошибкой.
+
+Task 3.5. Миграция 000004 — characters и bestiary_templates
+Что делаем: DDL для персонажей и монстров.
+Пошаговый план:
+1. internal/migrations/sql/000004_create_characters_and_bestiary.up.sql и .down.sql.
+2. characters: см. раздел 2.2 ТЗ.
+3. bestiary_templates: см. раздел 2.2 ТЗ. Индекс idx_bestiary_dm_id.
+4. down.sql — в обратном порядке.
+Как проверить: \d characters, \d bestiary_templates. Второй персонаж у того же player_id → ошибка UNIQUE. current_hp > max_hp → ошибка CHECK.
+
+Task 3.6. Telegram-конструктор персонажа (FSM)
+Что делаем: пошаговый диалог /create_character.
+Пошаговый план:
+1. internal/transport/telegram/fsm.go: состояния Idle, ChoosingRace, ChoosingClass, EnteringName, UploadingAvatar. Хранилище map[int64]*session под sync.Mutex. В session — состояние, черновик (raceID, classID, name) и время последнего действия; сессия старше 30 минут считается протухшей. /cancel сбрасывает диалог. Состояние хранится в памяти; после перезапуска диалог начинается заново.
+2. /create_character: если у игрока уже есть персонаж (GetByPlayerID) — отказ.
+3. Раса: inline-кнопки из rules (callback_data: race:<id>). Класс: class:<id>. Проверять, что состояние сессии соответствует нажатой кнопке.
+4. Имя: текст, 1–64 рун (utf8.RuneCountInString), после TrimSpace.
+5. Фото (обязательно по ТЗ): взять самый большой размер из Photo, получить ссылку на файл через методы библиотеки (GetFile и генерация ссылки на скачивание — сверить с документацией версии из go.mod), проверить file_size до скачивания, скачать, ValidateImage, Upload с префиксом avatars. Документы и прочие типы сообщений на этом шаге отклонять с подсказкой. Ошибка загрузки → сообщение игроку, состояние остаётся прежним.
+6. Расчёт: stats[k] = class.base_stats[k] + race.stat_modifiers[k]; ac = 10 + domain.Modifier(stats["DEX"]); max_hp = current_hp = class.starting_hp; level=1, xp=0; actions_json и bonus_actions_json копируются из класса.
+7. Сохранение; ErrCharacterExists (нарушение UNIQUE по player_id) маппится в понятное сообщение. Сброс FSM.
+8. Тесты: чистая функция расчёта персонажа (Воин + Человек: STR = 16, AC = 10 + Modifier(13)) и переходы FSM без сети.
+Как проверить: пройти диалог целиком. В БД запись (Воин + Человек: STR=16), аватар открывается по avatar_url. Повторный /create_character — отказ. /cancel посреди диалога сбрасывает состояние.
+
+Task 3.7. REST CRUD бестиария
+Что делаем: шаблоны монстров под JWT Мастера.
+Пошаговый план:
+1. internal/domain/bestiary.go (сущность, интерфейс, ErrTemplateNotFound), repository/postgres/bestiary.go, usecase/bestiary.go.
+2. Middleware: Auth + RequireRole(dm).
+3. Эндпоинты: POST /api/v1/bestiary — multipart/form-data. Поля: name, ac, max_hp, xp_reward, stats_json, actions_json, bonus_actions_json (строки с JSON), файл token (необязателен). GET /api/v1/bestiary, GET /api/v1/bestiary/{id} — только шаблоны этого Мастера. PUT /api/v1/bestiary/{id} — multipart; если пришёл новый файл, загрузить его, а старый объект удалить. DELETE /api/v1/bestiary/{id} — удалить запись и (best effort) объект из MinIO.
+4. Ограничить размер тела: http.MaxBytesReader(w, r.Body, 6<<20) перед разбором multipart.
+5. Валидация: name 1–128 рун; ac, max_hp > 0; xp_reward ≥ 0; actions_json и bonus_actions_json разбираются в []rules.Action, у каждого действия непустое name, damage_formula проходит dice.Parse, attack_bonus в разумных пределах; stats_json содержит все 6 характеристик.
+6. Чужой или несуществующий шаблон → 404.
+7. Тесты usecase: валидация и проверка владельца.
+Как проверить: создать монстра multipart-запросом (Postman или curl.exe -F). GET/PUT/DELETE отрабатывают. Токен монстра открывается по avatar_url. Кривая формула → 400.
+
+Task 3.8. REST — персонажи стола (только чтение)
+Что делаем: Мастер должен видеть, кем играют участники, чтобы собирать бой.
+Пошаговый план:
+1. GET /api/v1/tables/{id}/characters (JWT Мастера, владение столом → иначе 404).
+2. Запрос: участники стола со статусом accepted + LEFT JOIN characters. Ответ: [{player_id, telegram_username, character: {id, name, race, class, level, current_hp, max_hp, ac} | null}].
+Как проверить: у принявшего инвайт игрока без персонажа character: null; после /create_character — данные персонажа.
+
+DoD Спринта 3.
+- MinIO запущен, валидирует.
+- Правила загружаются из JSON.
+- Игрок собирает персонажа в Telegram.
+- Мастер создаёт шаблоны монстров.
+
+
+Спринт 4. Боевой движок, Event Bus, polling, XP
+Длительность: 2 недели.
+Фокус: боевой цикл, real-time события через polling, начисление опыта.
+
+Что изменилось относительно v2.2.
+Архитектурные решения (отличаются от ТЗ; при несогласии поправить до начала спринта):
+- PostgreSQL — единственный источник истины для состояния боя: раунд, текущий ход, порядок очереди и экономика действий хранятся в БД (колонки), а не в Redis. Причина: ТЗ требует SSOT и транзакции (TD-04); состояние из двух хранилищ нельзя обновить атомарно. Redis в MVP — только буфер событий для polling. Кэш очереди в Redis отложен (TD-24).
+- Снимок при создании боя: в encounter_entities копируется в том числе xp_reward. Иначе правка или удаление шаблона монстра после спавна ломает подсчёт XP.
+- Статус сущности (active / unconscious / dead) хранится явно (TD-06).
+- Event Bus с глобальными подписчиками: три подписчика регистрируются один раз при старте и сами фильтруют по encounter_id. События публикуются только после успешного commit.
+- Финал боя не удаляет Redis-ключи событий. Ключи живут по TTL, который продлевается на каждом событии (TD-16).
+- Нужны ход и атака от имени игрока из Telegram: новая Task 4.9.
+- Порядок задач изменён: polling теперь 4.6, после боевого цикла, чтобы проверять его на реальном бою.
+Правила D&D (официальные, раз в ТЗ не менялись): попадание, если бросок ≥ AC; натуральная 1 — промах; натуральная 20 — попадание и крит (кубики урона ×2); рост HP на уровне — среднее значение кубика + модификатор CON.
+Исправления ошибок v2.2: модификатор DEX через Modifier (не /2); HP игроков восстанавливаются после боя всем, а не только при Level Up (TD-01); явный ключ сортировки инициативы (TD-03); транзакции (TD-04); идемпотентный /finish (TD-05).
+
+Task 4.1. Миграция 000005 — бои, сущности, лог бросков
+Пошаговый план:
+1. internal/migrations/sql/000005_create_encounters_and_logs.up.sql и .down.sql.
+2. encounters, encounter_entities, dice_rolls_log — по разделу 2.2 ТЗ.
+3. down.sql в обратном порядке.
+Как проверить: миграция применяется при старте (версия 5). Второй незавершённый бой на тот же стол, невалидный entity_type или status — ошибки.
+
+Task 4.2. Event Bus + DB Log Subscriber
+Пошаговый план:
+1. internal/eventbus/event.go: Type (DiceRoll, Damage, TurnChange, EncounterStart, EncounterFinish); Event{Type, EncounterID, Payload any, CreatedAt}. Для каждого типа — своя структура payload (например, DiceRollPayload{ActorName, ActionName, RollType, Formula, Detail}).
+2. internal/eventbus/bus.go: Bus; Subscribe(name string, buffer int) <-chan Event (буфер по умолчанию 256); Publish(e Event) — неблокирующий: для каждого подписчика select с default. При переполнении писать Warn с именем подписчика и типом события (TD-15). Close() закрывает каналы подписчиков.
+3. internal/eventbus/subscribers/db_log.go: читает канал; события DiceRoll пишет в dice_rolls_log. Ошибки записи логируются, подписчик не падает.
+4. Остановка (TD-13): подписчики завершаются, когда Close() закрыл их канал и он опустел; run() ждёт их через sync.WaitGroup перед выходом.
+5. Правило для всех usecase: Publish вызывается после успешного commit транзакции.
+Как проверить: unit-тесты: два подписчика получают событие; подписчик, который не читает, не блокирует Publish (300 событий при буфере 256 — быстро и с предупреждениями); после Close() горутины завершаются.
+
+Task 4.3. Создание боя (preparing)
+Пошаговый план:
+1. POST /api/v1/encounters, тело: {"table_id": "...", "monsters": [{"template_id": "...", "count": 2}], "player_ids": ["..."]}. player_ids — id пользователей-игроков.
+2. Проверки (все до записи): стол принадлежит Мастеру (404 иначе); каждый игрок — участник стола со статусом accepted и у него есть персонаж (400 со списком проблемных); шаблоны принадлежат Мастеру (404 иначе); count 1–20, игроков ≥ 1, всего сущностей ≤ 30; на столе нет незавершённого боя (конфликт по частичному индексу → 409).
+3. Создание в одной транзакции (pgx.Tx): запись encounters (preparing) и все encounter_entities: игрок — копия из characters (current_hp, max_hp, ac, stats_json, actions_json, bonus_actions_json), source_id = characters.id, xp_reward = 0; монстр — count копий шаблона с именами <Name> #1, <Name> #2… (нумерация отдельно для каждого шаблона), xp_reward из шаблона.
+4. Ответ 201 с боем и списком сущностей. Дополнительно GET /api/v1/encounters/{id} (владелец): бой + сущности в порядке turn_position (до старта — по имени).
+5. Тесты usecase с mock: нумерация имён, отказ при не принявшем игроке, снимок xp_reward.
+Как проверить: POST с 2 гоблинами и 1 игроком → в БД encounters в preparing, 3 сущности с заполненными JSONB и xp_reward у гоблинов. Повторный POST на тот же стол → 409.
+
+Task 4.4. Инициатива и старт боя
+Пошаговый план:
+1. POST /api/v1/encounters/{id}/start (Мастер-владелец).
+2. Транзакция: SELECT status FROM encounters WHERE id=$1 FOR UPDATE — блокировка строки боя не даёт двум параллельным запросам запустить бой дважды. Статус не preparing → 409.
+3. Для каждой сущности последовательно: 1d20 + Modifier(DEX) (DEX берётся из stats_json); записать initiative_score. Кубики бросает Roller, который передан зависимостью (в тестах подставляется фиксированный).
+4. Сортировка в Go явным компаратором (sort.SliceStable), а не сравнением строк entity_type: 1) initiative_score по убыванию; 2) Modifier(DEX) по убыванию; 3) игрок раньше монстра (явный ранг: игрок 0, монстр 1); 4) display_name для детерминизма. Компаратор вынести в функцию и покрыть table-driven тестом.
+5. Записать turn_position (0…n−1), encounters.status='active', round=1, current_turn=0. Commit.
+6. После commit публиковать: DiceRoll на каждый бросок, EncounterStart (с порядком очереди), TurnChange (первый ходящий).
+Как проверить: бой с игроком и монстром при одинаковом DEX и принудительно равной инициативе (mock-Roller в тесте): игрок выше монстра. Второй /start → 409. Броски в dice_rolls_log.
+
+Task 4.5. Боевой цикл: атака, HP, смена хода
+Пошаговый план:
+1. POST /api/v1/encounters/{id}/actions/attack, тело {"actor_id","target_id","action_name"}. Сигнатура usecase: Attack(ctx, requester Identity, encounterID, req), где Identity{UserID, Role}. Мастер действует за любую сущность своего стола; игрок (Task 4.9) только за свою: characters.player_id == requester.UserID, иначе 403.
+2. Транзакция с блокировкой строки боя (FOR UPDATE): все действия одного боя выполняются последовательно.
+3. Проверки: бой active (409); актёр и цель принадлежат бою (404); actor.turn_position == encounters.current_turn и актёр active (409 «не ход этой сущности»); цель не dead; цель ≠ актёр (400).
+4. Действие ищется по action_name сначала в actions_json (тратит Action), затем в bonus_actions_json (тратит Bonus Action). Не найдено → 400; слот уже использован → 409.
+5. Бросок: d20; натуральная 1 — промах; натуральная 20 — попадание и крит; иначе d20 + attack_bonus ≥ target.ac — попадание. При попадании урон Roll(damage_formula) (при крите .Crit()); hp = max(0, hp − урон).
+6. hp == 0: монстр → dead, игрок → unconscious. Поставить флаг использованного слота, commit.
+7. После commit: DiceRoll (атака), DiceRoll (урон, если попал), Damage{target, damage, hp_left, status, all_monsters_dead}.
+8. POST /api/v1/encounters/{id}/turn/end (Мастер; игрок — Task 4.9): та же блокировка; найти следующую сущность по turn_position со статусом active, пропуская dead и unconscious; при переходе через конец очереди round++; если активных нет → 409 «нет активных участников, завершите бой». Обнулить action_used и bonus_action_used у той, чей ход начинается. После commit: TurnChange{round, entity}.
+9. Тесты usecase с mock-репозиторием и фиксированными кубиками: промах, попадание, крит, смерть монстра, потеря сознания игрока, пропуск хода мёртвого, повторное использование Action (409), чужой ход (409).
+Как проверить: провести раунд через curl.exe. HP цели уменьшилось; броски в dice_rolls_log; мёртвый монстр пропускается; после круга round вырос.
+
+Task 4.6. Redis Event Buffer + polling-эндпоинт
+Пошаговый план:
+1. go get github.com/redis/go-redis/v9; подключение в run() с Ping; закрытие при остановке.
+2. subscribers/redis_buffer.go: для каждого события сериализовать JSON {"type","encounter_id","payload","created_at"} и в одном pipeline выполнить RPUSH encounter:<id>:events <json> и EXPIRE encounter:<id>:events 86400. TTL продлевается на каждом событии. Ошибки Redis логируются, подписчик продолжает работу.
+3. GET /api/v1/encounters/{id}/events?after=<index> (JWT Мастера, бой принадлежит его столу иначе 404). after — целое ≥ 0 (по умолчанию 0), иначе 400.
+4. LRANGE encounter:<id>:events <after> -1. Ответ: {"events": [...], "next_index": after + len(events)}. Если список истёк по TTL и клиент пришёл с after, который больше длины списка, вернуть next_index = LLEN.
+5. Тесты: подписчик и хендлер против miniredis (github.com/alicebob/miniredis/v2) или mock-интерфейса; проверить after=0, after=N, пустой результат.
+Как проверить: запустить цикл опроса (PowerShell):
+$i = 0
+while ($true) {
+  r=curl.exe-s"http://localhost:8080/api/v1/encounters/id/events?after=$i" `
+    -H "Authorization: Bearer $token" | ConvertFrom-Json
+  $r.events | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 5 }
+  $i = $r.next_index
+  Start-Sleep -Seconds 1
+}
+Пока цикл работает, выполнять атаки: события появляются по одному, без повторов.
+
+Task 4.7. Telegram Notification Publisher
+Пошаговый план:
+1. subscribers/telegram.go: подписчик получает события, находит Telegram-id игроков этого боя (репозиторий: encounter_entities типа player → characters → users.telegram_id) и отправляет сообщения через интерфейс нотификатора (как в Task 2.6).
+2. Форматирование в отдельной чистой функции formatEvent(e) string (на русском): начало боя и порядок ходов; «Гоблин #1 атакует Арвена: попадание, 7 урона (HP: 5/12)»; «Ход: <имя>, раунд N»; финал боя с XP.
+3. Отправка последовательно с небольшой паузой; ошибки вроде «бот заблокирован пользователем» логируются как warn, не роняют подписчика.
+4. Тесты formatEvent на примерах каждого типа события.
+Как проверить: запустить бой с игроком: в Telegram приходят сообщения о старте, атаках и смене хода.
+
+Task 4.8. Финал боя и XP
+Пошаговый план:
+1. POST /api/v1/encounters/{id}/finish (Мастер-владелец).
+2. Идемпотентность (TD-05) атомарным UPDATE, а не «прочитал статус, потом записал»: UPDATE encounters SET status='finished', finished_at=now() WHERE id=$1 AND status='active'. Затронуто 0 строк → 409. Начисление XP выполняется только после успешного UPDATE.
+3. Всё в одной транзакции: totalXP = SUM(xp_reward) сущностей monster со status='dead' из снимка в encounter_entities; для каждого игрока боя (включая потерявших сознание): xp += totalXP (полностью, по ТЗ); newLevel = rules.LevelForXP(xp); за каждый полученный уровень max_hp += max(1, hit_die/2 + 1 + Modifier(CON)); всем игрокам боя: current_hp = max_hp (TD-01), независимо от Level Up.
+4. Redis-ключи событий не удалять (см. решение выше).
+5. После commit: EncounterFinish{total_xp, players: [{name, xp_gained, level_before, level_after, hp}]}.
+6. Тесты usecase: XP из снимка при удалённом шаблоне; повторный вызов → 409 и XP не удваивается; повышение сразу на два уровня; восстановление HP игроку без Level Up; потерявший сознание игрок тоже получает XP.
+Как проверить: бой на 300 XP (2 гоблина по 150). После /finish каждому игроку +300 XP, уровень растёт при достижении порога, current_hp = max_hp. Второй /finish → 409, XP не изменился. В polling пришёл EncounterFinish.
+
+Task 4.9. Telegram — ход игрока кнопками
+Что делаем: игрок управляет своим ходом из Telegram.
+Пошаговый план:
+1. Когда наступает ход игрока (TurnChange), сообщение из Task 4.7 идёт с кнопками «Атаковать» и «Закончить ход».
+2. Цепочка callback (индексы вместо имён, чтобы уложиться в лимит callback_data 64 байта): atk:<encounter_id> → показать действия персонажа (act:<encounter_id>:<action_idx>; бонусные действия — в конце списка); act:<encounter_id>:<action_idx> → показать живые цели (tgt:<encounter_id>:<action_idx>:<turn_position>); tgt:... → вызвать Attack с Identity{UserID: игрок, Role: player}; end:<encounter_id> → EndTurn от игрока.
+3. Игрок определяется по telegram_id. Сервер проверяет всё сам: чей ход, чей актёр, какой слот свободен. Данным из callback_data не доверяем.
+4. После действия сообщение редактируется (результат атаки); общие уведомления всем игрокам идут через обычный Publisher.
+5. Ошибки usecase (не твой ход, слот занят) — AnswerCallbackQuery с понятным текстом.
+Как проверить: бой с одним игроком и одним монстром. Игрок атакует и завершает ход кнопками; попытка нажать «Атаковать» вне своего хода даёт alert; Мастер видит все события в polling.
+
+DoD Спринта 4.
+- Бой создаётся с нумерованными копиями монстров.
+- Броски и урон корректны.
+- События доступны через polling-эндпоинт и приходят в Telegram.
+- XP начисляется, Level Up срабатывает.
+
+
+Спринт 5. Swagger UI, контейнеризация, CI, документация
+Длительность: 2 недели.
+Фокус: интерактивная документация, запуск всего стека одной командой, CI, README.
+
+Что изменилось относительно v2.2:
+- Postman: токен сохраняется в скрипте Tests (post-response) запроса login, а не Pre-request.
+- .dockerignore не должен исключать docs/: swag init создаёт в docs/ Go-пакет (docs.go), без него сборка упадёт.
+- Версия Go в Dockerfile и README должна быть не ниже версии из go.mod (сейчас 1.26.2), а не 1.23.
+- Внутри контейнера хосты БД, Redis и MinIO другие (postgres, redis, minio), их нужно переопределить в compose.
+- Путь к правилам задаётся RULES_DIR (TD-08).
+- Новая 5.5: CI на GitHub Actions (TD-11).
+- Multipart в Swagger описан явно (TD-21).
+
+Task 5.1. Swagger UI / OpenAPI
+Пошаговый план:
+1. go install github.com/swaggo/swag/cmd/swag@latest, go get github.com/swaggo/http-swagger.
+2. Общие аннотации в main.go: @title, @version, @BasePath /api/v1, схема безопасности BearerAuth (@securityDefinitions.apikey, in header, name Authorization; в UI вводится как Bearer <token>).
+3. Аннотировать каждый хендлер: @Summary, @Tags, @Accept, @Produce, @Param, @Success, @Failure, @Security BearerAuth. Для multipart: @Accept mpfd и @Param token formData file false "...", остальные поля как formData (Task 3.7).
+4. Генерация: swag init -g cmd/app/main.go. Результат (docs/docs.go, swagger.json, swagger.yaml) коммитится в репозиторий.
+5. В main.go импортировать пакет docs пустым импортом _ ".../docs", смонтировать /swagger/* в chi через httpSwagger.Handler.
+6. Проверить, что видны все группы: auth, tables, characters (3.8), bestiary, encounters, events.
+Как проверить: http://localhost:8080/swagger/index.html. Login через UI → токен → Authorize → защищённые ручки вызываются. Загрузка токена монстра через форму в UI работает.
+
+Task 5.2. Postman-коллекция
+Пошаговый план:
+1. docs/postman_collection.json: папки Auth, Tables, Characters, Bestiary, Encounters, Events. Для каждого запроса метод, URL, тело, пример ответа.
+2. Переменные окружения: {{base_url}}, {{jwt}}, {{table_id}}, {{encounter_id}}, {{next_index}}.
+3. Авторизация на уровне коллекции: Bearer {{jwt}}.
+4. Скрипт Tests запроса login: сохранить token из ответа в jwt. Скрипт Tests запроса events: сохранить next_index. Скрипты создания стола и боя сохраняют id в table_id и encounter_id.
+5. Инструкция по импорту в README.
+Как проверить: импортировать коллекцию, выбрать окружение и прогнать сценарий: login → стол → инвайт → бестиарий → бой → атаки → events → finish. Токены и id подставляются сами.
+
+Task 5.3. Dockerfile
+Пошаговый план:
+1. deploy/Dockerfile, multi-stage: builder — golang:1.26-alpine (тег не ниже версии из go.mod), WORKDIR /src, COPY go.mod go.sum ./, go mod download, COPY . ., CGO_ENABLED=0 go build -o /out/app ./cmd/app; final — alpine:3.20, apk add --no-cache ca-certificates tzdata, пользователь adduser -D -u 10001 appuser, COPY --from=builder /out/app /usr/local/bin/app, COPY --from=builder /src/configs /configs, ENV RULES_DIR=/configs/rules, USER appuser, ENTRYPOINT ["/usr/local/bin/app"].
+2. Миграции уже вшиты в бинарник (embed), отдельно копировать не нужно.
+3. .dockerignore: .git, bin/, tmp/, .env, docs/postman_collection.json. docs/ целиком не исключать.
+4. Без distroless и без оптимизации размера.
+Как проверить: docker build -t vtt-app -f deploy/Dockerfile .. Запуск docker run --rm --env-file .env vtt-app — правила находятся, процесс работает от appuser (docker run --rm --entrypoint id vtt-app).
+
+Task 5.4. Итоговый docker-compose
+Пошаговый план:
+1. Сервис app в deploy/docker-compose.yml: build: {context: .., dockerfile: deploy/Dockerfile}, env_file: ../.env, ports: 8080:8080, restart: unless-stopped.
+2. Переопределить в environment адреса внутри сети Compose (значения environment перекрывают env_file): POSTGRES_HOST=postgres, POSTGRES_PORT=5432, REDIS_HOST=redis, REDIS_PORT=6379, MINIO_ENDPOINT=minio:9000. MINIO_PUBLIC_URL оставить адресом для браузера (http://localhost:9000).
+3. depends_on с condition: service_healthy для postgres, redis, minio. Healthcheck самого приложения: wget -qO- http://localhost:8080/healthz (wget есть в alpine).
+4. Секреты только через .env; .env.example содержит все нужные переменные (включая TELEGRAM_BOT_TOKEN, JWT_SECRET, RULES_DIR).
+Как проверить: dc up --build -d → все сервисы healthy, app стартовал после остальных. curl.exe http://localhost:8080/healthz → ok. В логах приложения «migrations applied».
+
+Task 5.5. CI (GitHub Actions)
+Пошаговый план:
+1. .github/workflows/ci.yml, триггер: push и pull request в main.
+2. Шаги: checkout → actions/setup-go с go-version-file: go.mod → go vet ./... → go test ./... → golangci-lint (официальный action) → docker build -f deploy/Dockerfile ..
+3. Интеграционные тесты с реальной БД (TD-10) пока не входят в CI.
+4. Бейдж статуса в README.
+Как проверить: пуш в ветку: зелёная сборка во вкладке Actions. Намеренно сломать тест — сборка краснеет.
+
+Task 5.6. Ручной E2E-чеклист
+Пошаговый план: пройти сценарий, каждый шаг зафиксировать с ожидаемым результатом (для README).
+1. Развёртывание: cp .env.example .env (PowerShell: Copy-Item .env.example .env), заполнить, dc up --build -d, dc ps — все healthy.
+2. Мастер: Swagger → register → login → Authorize.
+3. Стол и инвайт: создать стол, пригласить игроков по @username, принять кнопкой.
+4. Персонаж: /create_character у каждого игрока.
+5. Бестиарий: 2–3 шаблона с токенами (multipart).
+6. Бой: создать → /start → цикл опроса events (Task 4.6) → атаки (Swagger и кнопки Telegram) → turn/end → /finish.
+7. Проверки: XP и уровень в БД (SELECT name, level, xp, current_hp, max_hp FROM characters;), повторный /finish → 409, вызов без токена → 401, чужой стол → 404.
+Как проверить: все шаги проходят, скриншоты или логи приложены к README.
+
+Task 5.7. README.md
+Пошаговый план:
+1. Архитектура: ASCII-диаграмма (REST + polling, Telegram, PostgreSQL как SSOT, Redis event buffer, MinIO, Event Bus с тремя подписчиками).
+2. Быстрый старт: требования (Docker; Go версии из go.mod), .env.example, запуск docker compose -f deploy/docker-compose.yml --env-file .env up --build -d (для Windows/PowerShell и bash одинаково), проверка /healthz, ссылка на Swagger.
+3. Руководство Мастера: Swagger UI и Postman, примеры запросов.
+4. Руководство Игрока: /start, /create_character, инвайты, управление в бою.
+5. E2E-чеклист (из 5.6).
+6. Раздел «Решения и ограничения»: XP начисляется полностью каждому игроку; правила атаки и крита официальные; ссылка на docs/TECH_DEBT.md.
+7. Бейдж CI.
+Как проверить: открыть README в предпросмотре; пройти раздел «Быстрый старт» на чистой машине или в чистой папке — команды работают без правок.
+
+DoD Спринта 5.
+- Swagger UI доступен, все эндпоинты документированы.
+- Postman-коллекция в репозитории.
+- Стек запускается через docker-compose up --build.
+- E2E пройдено.
+- README оформлен.
+
+
+Технический долг и бэклог уточнений (v2.0)
+Документ обновлён после закрытия Спринта 1 и пересмотра задач Спринтов 2–5 (v2.3). Нумерация TD-01…TD-22 сохранена; новые пункты — TD-23 и выше, хвосты Спринта 1 — S1-1…S1-6.
+
+Как использовать.
+- Хранить в репозитории как docs/TECH_DEBT.md.
+- В конце каждого спринта пересматривать открытые пункты и закрывать 1–2, если это не ломает график.
+- Приоритеты: P0 — закрыть до конца Спринта 4 (все P0 уже встроены в задачи); P1 — до публикации в портфолио; P2 — после MVP.
+
+Закрыто внутри задач (отдельно делать не нужно).
+
+TD-01. HP всех игроков восстанавливается после боя — Task 4.8.
+TD-02. Все три подписчика Event Bus — 4.2 (DB Log), 4.6 (Redis Buffer), 4.7 (Telegram).
+TD-03. Явная сортировка инициативы (компаратор в Go) — Task 4.4.
+TD-04. Транзакции для боя — 4.3, 4.4, 4.5, 4.8.
+TD-05. Идемпотентность /finish (атомарный UPDATE ... WHERE status='active') — Task 4.8.
+TD-06. Статус unconscious / dead в encounter_entities — 4.1, 4.5.
+TD-07. Проверка расширения и содержимого картинок — Task 3.2.
+TD-08. Путь к правилам через RULES_DIR — 3.4, 5.3.
+TD-11. CI через GitHub Actions — Task 5.5.
+TD-12. Формула роста HP при Level Up (среднее значение кубика + модификатор CON) — Task 4.8.
+TD-13. Graceful shutdown бота и Event Bus — 2.2, 4.2.
+TD-14. GetOrCreatePlayer не затирает username — Task 2.3.
+TD-15. Переполнение Event Bus: буфер 256 и предупреждение в лог при потере (остаток — TD-23) — Task 4.2.
+TD-16. Стратегия TTL: продлевается на каждом событии — Task 4.6.
+TD-19. Устаревшие callback-кнопки — Task 2.7.
+TD-21. OpenAPI для multipart — Task 5.1.
+S1-1. main.go: run() error, чтобы defer срабатывали — Task 2.1.
+S1-2. /me — настоящая реализация — Task 2.1.
+S1-3. Лог деталей 500 в хендлерах — Task 2.1.
+
+P1 — до публикации в портфолио.
+
+TD-09. Тесты критичной логики. Основная часть теста уже требуется в задачах (кубики и Modifier, правила, инициатива, атака, XP, FSM, usecase столов и инвайтов). Остаётся: HTTP-тесты хендлеров через httptest для ключевых сценариев (register/login, создание боя).
+
+TD-10. Интеграционные тесты репозиториев. После Спринта 4, через testcontainers-go или отдельную тестовую БД: миграции, CRUD, поведение транзакций, частичный уникальный индекс боёв.
+
+TD-23. Лог бросков внутри транзакции. Сейчас dice_rolls_log пишется подписчиком шины, а шина может терять события при переполнении буфера. Надёжнее писать строки лога в той же транзакции, что и изменение состояния боя, а шину оставить для Redis и Telegram. Решить после Спринта 4.
+
+S1-4. Проверка Content-Type: application/json. При неверном заголовке отвечать 415; для multipart-эндпоинтов пропускать.
+
+S1-5. migrations.Run. Различать «применено N миграций» и «нечего делать» в логе; обработать состояние dirty (понятная ошибка с подсказкой про force).
+
+S1-6. Один драйвер БД вместо двух. Сейчас pgxpool (приложение) и lib/pq (migrate). Перейти на migrate/database/pgx/v5.
+
+TD-24. Кэш очереди инициативы в Redis (по ТЗ). Отложен: в MVP всё состояние боя читается из PostgreSQL. Делать по необходимости, по схеме «читаем из кэша, при промахе из БД, кэш обновляем после commit».
+
+Косметика. repository/postgres/user.go: сгруппировать импорты (pgconn, pgx/v5, pgxpool). usecase/auth.go: импорт token вернуть в общую группу локальных.
+
+P2 — после MVP.
+
+TD-17. Пагинация limit/offset для GET /tables, GET /bestiary, при необходимости GET /tables/{id}/members.
+
+TD-18. Метрики Prometheus (опционально): число боёв, бросков, latency эндпоинтов, потерянные события шины.
+
+TD-20. Деплой на VPS: домен, HTTPS, Swagger UI, бот. Живое демо усиливает портфолио.
+
+TD-22. Rate limiting и защита от спама для REST и команд бота.
+
+TD-25. Повторный инвайт после declined. Сейчас любой существующий статус даёт 409; возможно, нужен «пере-инвайт», сбрасывающий статус в pending.
+
+TD-26. Отдельный ключ доступа MinIO для приложения вместо root-учётки; политика только на нужный бакет.
+
+S1-7. Гонка в UserRepo.Update (lost update при параллельной записи): обновлять только изменённые поля или добавить оптимистичную блокировку (version).
+
+Решения, отличающиеся от официальных правил D&D 5e.
+Зафиксированы осознанно; при желании можно изменить.
+- XP: суммарный XP убитых монстров начисляется полностью каждому игроку (по ТЗ). По официальным правилам XP делится между участниками.
+- Стартовые HP: берутся из classes.json без учёта расового бонуса к CON (упрощение).
+- AC: 10 + модификатор DEX (без брони и щитов).
+- Всё остальное (попадание ≥ AC, натуральные 1 и 20, крит удваивает кубики урона, рост HP на уровне, пороги XP) — официальные правила.
+
+
