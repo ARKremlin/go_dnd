@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS table_membes;
+DROP TABLE IF EXISTS tables;
