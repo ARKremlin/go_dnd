@@ -20,8 +20,8 @@ func NewTableRepo(pool *pgxpool.Pool) *TableRepo {
 
 func (r *TableRepo) Create(ctx context.Context, t *domain.Table) error {
 	const q = `
-INSERT INTO tables (dm_id, name)
-VALUES (&1, &2)
+INSERT INTO game_tables (dm_id, name)
+VALUES ($1, $2)
 RETURNING id, created_at`
 
 	err := r.pool.QueryRow(ctx, q, t.DMID, t.Name).Scan(&t.ID, &t.CreatedAt)

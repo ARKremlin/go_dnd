@@ -1,2 +1,2 @@
-DROP TABLE IF EXISTS table_membes;
-DROP TABLE IF EXISTS tables;
+DROP TABLE IF EXISTS table_members;
+DROP TABLE IF EXISTS game_tables;
